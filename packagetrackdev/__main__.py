@@ -336,7 +336,7 @@ MCP_MOVED = """\
 packagetrackdev mcp is gone: the MCP server is its own package, packagetrackdev-mcp.
   install it:   curl -fsSL https://packagetrack.dev/install.sh | sh
                 (installs both tools), or the server alone:
-                uv tool install "packagetrackdev-mcp @ https://packagetrack.dev/cli/packagetrackdev-mcp-latest.whl"
+                uv tool install --find-links https://packagetrack.dev/cli/ packagetrackdev-mcp
   register it:  claude mcp add -s user packagetrackdev -- packagetrackdev-mcp
                 (after: claude mcp remove packagetrackdev, if the old entry is there)
   https://github.com/packagetrack-dev/packagetrackdev-mcp"""  # noqa: E501

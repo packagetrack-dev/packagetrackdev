@@ -23,7 +23,7 @@ Installs `uv` if needed, then this package and
 as `uv` tools. No root required. To install only the CLI:
 
 ```sh
-uv tool install "packagetrackdev @ https://packagetrack.dev/cli/packagetrackdev-latest.whl"
+uv tool install --find-links https://packagetrack.dev/cli/ packagetrackdev
 ```
 
 Requires Python 3.11+.

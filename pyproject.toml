@@ -1,6 +1,6 @@
 [project]
 name = "packagetrackdev"
-version = "0.2.0"
+version = "0.2.1"
 description = "What your build's dependencies changed since you locked them"
 readme = "README.md"
 license = "MIT"
