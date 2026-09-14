@@ -1,0 +1,43 @@
+[project]
+name = "packagetrackdev"
+version = "0.2.0"
+description = "What your build's dependencies changed since you locked them"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Fatih Melih Ersoy" }]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28",
+]
+keywords = ["dependencies", "changelog", "lockfile", "security"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://packagetrack.dev"
+Repository = "https://github.com/packagetrack-dev/packagetrackdev"
+Issues = "https://github.com/packagetrack-dev/packagetrackdev/issues"
+
+[project.scripts]
+packagetrackdev = "packagetrackdev.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["packagetrackdev"]
