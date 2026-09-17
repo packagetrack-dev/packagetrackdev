@@ -21,6 +21,9 @@ from packagetrackdev.lockfiles import (
     find,
     read,
 )
+from packagetrackdev.lockfiles import (
+    ecosystems as lockfile_ecosystems,
+)
 
 REQUEST_TIMEOUT = 60.0
 
@@ -377,7 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument(
             "--ecosystem",
             default=None,
-            choices=("pypi", "npm"),
+            choices=lockfile_ecosystems(),
             help="default: every lock file found",
         )
         target.add_argument("--server", default=None)

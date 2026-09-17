@@ -5,6 +5,12 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-17
+
+### Fixed
+
+- `--ecosystem` accepts every ecosystem the lock readers know (cargo, composer, go, npm, pypi), not only pypi and npm.
+
 ## [0.2.1] - 2026-09-15
 
 ### Fixed

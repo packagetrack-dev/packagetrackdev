@@ -55,6 +55,11 @@ MANIFESTS = (
 )
 
 
+def ecosystems() -> tuple[str, ...]:
+    """Every ecosystem a lock file or manifest here can be read for."""
+    return tuple(sorted({eco for eco, _ in LOCKFILES + MANIFESTS}))
+
+
 def find(project: Path) -> list[tuple[str, Path]]:
     """Find the dependency file for each ecosystem, preferring lock files."""
     chosen: dict[str, Path] = {}
