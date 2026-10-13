@@ -18,6 +18,9 @@ _TAG_FRAGMENT = re.compile(r"</?[A-Za-z][^<>]*$")
 
 _ROLE = re.compile(r":[A-Za-z]+(?::[A-Za-z]+)*:`(~?)([^`]+)`")
 _ROLE_BARE = re.compile(r":[A-Za-z]+(?::[A-Za-z]+)*:(~?)([A-Za-z_][\w.]*)")
+_ROLE_HTML = re.compile(
+    r"(?<![\w:]):[A-Za-z]+(?::[A-Za-z]+)*:<code>(~?)([^<]+)</code>", re.IGNORECASE
+)
 
 _SPACES = re.compile(r"\s{2,}")
 _SPACE_BEFORE_CLOSE = re.compile(r"\s+([)\]}.,;:!?])")
@@ -29,9 +32,14 @@ _SKIP = re.compile(
     r"related issues and pull requests on github)",
     re.IGNORECASE,
 )
+_LINK_LABEL = re.compile(r"^[A-Z]\w*:?$")
 _CREDIT = re.compile(r"\s+by\s+@[\w.-]+(\s+in)?\s*$", re.IGNORECASE)
 
-_VERSION_ONLY = re.compile(r"^\[?v?\d+(\.\d+)+\]?( - \d{4}-\d{2}-\d{2})?$")
+_VERSION_ONLY = re.compile(
+    r"^\[?v?\d+(\.\d+)+\]?"
+    r"( - \d{4}-\d{2}-\d{2}| \((?=[^()]*\b(?:19|20)\d{2}\b)[\w ,./-]+\))?$"
+)
+_RST_ANCHOR = re.compile(r"^\.\. _\S+:?$")
 _KAC_SECTION = re.compile(
     r"^(added|changed|deprecated|removed|fixed|security|unreleased"
     r"|breaking changes?"
@@ -48,12 +56,16 @@ _ONE_WORD = re.compile(r"^[A-Za-z][\w.-]*$")
 
 _FENCE = re.compile(r"^(?:```|~~~)[A-Za-z0-9_+.#-]*$")
 _HEADING = re.compile(r"^#{1,6}\s*\S")
+_MD_HEADING = re.compile(r"^#{1,6}\s+\S")
+_HTML_HEADING = re.compile(r"^<h[1-6][^>]*>.*</h[1-6]>$", re.IGNORECASE)
 _TABLE_ROW = re.compile(r"^\|")
 _LIST_ITEM = re.compile(r"^(?:[-*+•]|\d+[.)])\s+\S")
 _RULE = re.compile(r"^(?:-{2,}|={2,}|_{2,}|\*{3,}|~{3,})$")
 _INDENTED = re.compile(r"^(?:\t| {4,})\S")
 _HTMLISH = re.compile(r"</?[A-Za-z][A-Za-z0-9]*(?:\s|/?>)|&(?:lt|gt);")
 _QUOTE_MARKER = re.compile(r"^>+\s*")
+_HTML_ELEMENT = re.compile(r"<(/?)(?:li|p)(?:\s[^<>]*)?>", re.IGNORECASE)
+_HTML_RECORD = re.compile(r"^(?:[-*+•]\s|\d+[.)]\s|[a-z]+(?:\([^)]*\))?!?:\s)")
 
 WRAP_FLOOR = 60
 WRAP_SLACK = 2
@@ -66,6 +78,7 @@ class _Block:
 
     text: str
     prose: bool
+    heading: bool = False
 
 
 def _is_scaffolding(line: str) -> bool:
@@ -77,6 +90,7 @@ def _is_scaffolding(line: str) -> bool:
         or _DATE_ONLY.match(line)
         or _KAC_SECTION.match(line)
         or _NUMBER_ONLY.match(line)
+        or _RST_ANCHOR.match(line)
     )
 
 
@@ -110,12 +124,36 @@ def _reflow_piece(piece: list[str]) -> list[_Block]:
     return [_Block(line, prose=True) for line in piece]
 
 
+def _element_open(line: str, was_open: bool) -> bool:
+    """Return True if an `<li>` or `<p>` is still open after this line."""
+    tags = _HTML_ELEMENT.findall(line)
+    if not tags:
+        return was_open
+    return tags[-1] != "/"
+
+
+def _continues_html(above: str, line: str) -> bool:
+    """Return True if an HTML line carries on the sentence of the one above."""
+    before, after = _clean(above), _clean(line)
+    opening = _TAG.sub("", line).strip()
+    return bool(
+        before
+        and after
+        and (after[0].islower() or after[0].isdigit())
+        and not _HTML_RECORD.match(opening)
+        and not _HTML_RECORD.match(after)
+        and not _ends_the_line(before)
+    )
+
+
 def _blocks(body: str) -> list[_Block]:
     """Split a note into blocks."""
     blocks: list[_Block] = []
     open_lines: list[str] = []
     open_kind: str | None = None
     in_code = False
+    html_tail: int | None = None
+    element_open = False
 
     def close() -> None:
         nonlocal open_kind
@@ -126,6 +164,7 @@ def _blocks(body: str) -> list[_Block]:
 
     for raw in body.splitlines():
         stripped = raw.strip()
+        tail, html_tail = html_tail, None
 
         if _FENCE.match(stripped):
             close()
@@ -139,12 +178,26 @@ def _blocks(body: str) -> list[_Block]:
             continue
         if _HEADING.match(stripped) or _TABLE_ROW.match(stripped):
             close()
-            blocks.append(_Block(stripped, prose=False))
+            blocks.append(
+                _Block(stripped, prose=False, heading=bool(_MD_HEADING.match(stripped)))
+            )
             continue
         if _HTMLISH.search(stripped):
             close()
-            blocks.append(_Block(stripped, prose=False))
+            heading = bool(_HTML_HEADING.match(stripped))
+            if (
+                tail is not None
+                and element_open
+                and not heading
+                and _continues_html(blocks[tail].text, stripped)
+            ):
+                blocks[tail] = _Block(f"{blocks[tail].text} {stripped}", prose=True)
+            else:
+                blocks.append(_Block(stripped, prose=False, heading=heading))
+            element_open = _element_open(stripped, element_open)
+            html_tail = len(blocks) - 1
             continue
+        element_open = False
 
         probe = _clean(stripped)
         if not probe:
@@ -259,7 +312,7 @@ def _role_text(match: re.Match) -> str:
 
 
 def _clean(raw: str) -> str:
-    line = raw.strip()
+    line = _ROLE_HTML.sub(_role_text, raw.strip())
     line = _TAG.sub(" ", line)
     line = _TAG_FRAGMENT.sub("", line)
     line = html_module.unescape(line)
@@ -267,7 +320,10 @@ def _clean(raw: str) -> str:
     line = _TAG_FRAGMENT.sub("", line)
 
     line = _MD_LINK.sub(r"\1", line)
-    line = _BARE_URL.sub("", line)
+    without_url = _BARE_URL.sub("", line)
+    if without_url != line and _LINK_LABEL.match(_MARKUP.sub("", without_url).strip()):
+        return ""
+    line = without_url
     line = _ROLE.sub(_role_text, line)
     line = _ROLE_BARE.sub(_role_text, line)
     line = _MARKUP.sub("", line).strip().lstrip("#*->• ").strip(" :")
@@ -284,20 +340,27 @@ def summarise(body: str, limit: int = NOTE_LINES) -> list[str]:
         line = _clean(block.text)
         if not line or line.startswith("<") or _SKIP.match(line):
             continue
-        cleaned.append(_Block(line, block.prose))
+        cleaned.append(_Block(line, block.prose, block.heading))
 
     lines: list[str] = []
+    headings: list[bool] = []
     for position, block in enumerate(cleaned):
         if _is_scaffolding(block.text):
             continue
         following = cleaned[position + 1].text if position + 1 < len(cleaned) else None
         if _echoed_heading(block.text, following):
             continue
+        if block.heading and len(lines) >= limit - 1:
+            break
         parts = _sentences(block.text) if block.prose else [block.text]
         for part in parts:
             lines.append(clip(part))
+            headings.append(block.heading)
             if len(lines) >= limit:
                 return lines
+    while headings and headings[-1]:
+        lines.pop()
+        headings.pop()
     return lines
 
 

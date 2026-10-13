@@ -146,6 +146,59 @@ def detect(content: str, filename: str | None = None) -> tuple[str, str] | None:
     return None
 
 
+FORMATS_BY_SUFFIX = {
+    ".json": frozenset(
+        {"package-lock.json", "package.json", "composer.lock", *sbom.FORMATS}
+    ),
+    ".lock": frozenset({"uv.lock", "poetry.lock", "Cargo.lock", "composer.lock"}),
+    ".mod": frozenset({"go.mod"}),
+    ".txt": frozenset({"requirements.txt"}),
+}
+REQUIREMENTS_WORDS = ("requirement", "constraint")
+
+NOT_A_DEPENDENCY_NAME = "not_a_dependency_name"
+NOT_THIS_SUFFIX = "not_this_suffix"
+NOT_NAMED_REQUIREMENTS = "not_named_requirements"
+UNPINNED_UNNAMED = "unpinned_unnamed"
+
+_SPECIFIER = re.compile(r"(==|===|!=|<=?|>=?|~=)")
+
+
+def may_open(filename: str) -> bool:
+    """Whether a file of this name may be opened to look for dependencies."""
+    base = filename.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    known = {name.lower() for name in SUPPORTED_FILES}
+    return base in known or base.endswith(tuple(FORMATS_BY_SUFFIX))
+
+
+def refusal(
+    detected: str, filename: str | None, content: str, folder: str = ""
+) -> str | None:
+    """Why `detected` may not be read from this file, or None when it may."""
+    if filename is None:
+        if detected == "requirements.txt" and not any(
+            _SPECIFIER.search(line.split("#", 1)[0])
+            for line in content.splitlines()
+            if not line.lstrip().startswith("-")
+        ):
+            return UNPINNED_UNNAMED
+        return None
+    base = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    lowered = base.lower()
+    if lowered in {name.lower() for name in SUPPORTED_FILES}:
+        return None
+    if not may_open(base):
+        return NOT_A_DEPENDENCY_NAME
+    suffix = next(s for s in FORMATS_BY_SUFFIX if lowered.endswith(s))
+    if detected not in FORMATS_BY_SUFFIX[suffix]:
+        return NOT_THIS_SUFFIX
+    if detected == "requirements.txt":
+        named = f"{folder}/{lowered}".lower()
+        if not any(word in named for word in REQUIREMENTS_WORDS):
+            return NOT_NAMED_REQUIREMENTS
+    return None
+
+
 def read(ecosystem: str, path: Path) -> Project | None:
     try:
         content = path.read_text(encoding="utf-8")
@@ -179,8 +232,63 @@ def _read_sbom(ecosystem: str, filename: str, content: str) -> Project | None:
     )
 
 
+_SEP = "[-_]"
+_CREDENTIAL = re.compile(
+    r"^(?=[^\d]*\d)(?:"
+    rf"gh[pousr]{_SEP}[a-z0-9]{{36,}}"
+    rf"|github{_SEP}pat{_SEP}[a-z0-9_-]{{60,}}"
+    rf"|glpat{_SEP}[a-z0-9_-]{{20,}}"
+    rf"|sk{_SEP}(?:live|test|proj|ant){_SEP}[a-z0-9_-]{{8,}}"
+    rf"|[sr]k{_SEP}(?:live|test){_SEP}[a-z0-9]{{16,}}"
+    rf"|xox[abposr]{_SEP}[a-z0-9-]{{10,}}"
+    r"|akia[0-9a-z]{16}"
+    r"|aiza[0-9a-z_-]{35}"
+    rf"|npm{_SEP}[a-z0-9]{{36}}"
+    rf"|pypi{_SEP}age[a-z0-9_-]{{50,}}"
+    rf"|pkgt{_SEP}[a-z0-9_-]{{16,}}"
+    r")$",
+    re.IGNORECASE,
+)
+
+CREDENTIALS_LEFT_OUT = (
+    "{count} {entries} looked like an access token or API key and {were} not "
+    "sent. Remove {it} from the file, and revoke {it} if {it_is} real."
+)
+
+
+def looks_like_credential(name: str) -> bool:
+    """Whether a dependency name is shaped like an access token or API key."""
+    return bool(_CREDENTIAL.match(name.strip()))
+
+
+def _without_credentials(project: Project) -> Project:
+    """Leave out of `project` every entry shaped like a credential, and say so."""
+    kept = [d for d in project.dependencies if not looks_like_credential(d.name)]
+    left_out = len(project.dependencies) - len(kept)
+    if not left_out:
+        return project
+    one = left_out == 1
+    said = CREDENTIALS_LEFT_OUT.format(
+        count=left_out,
+        entries="entry" if one else "entries",
+        were="was" if one else "were",
+        it="it" if one else "them",
+        it_is="it is" if one else "they are",
+    )
+    project.dependencies = kept
+    project.skipped += left_out
+    project.note = f"{project.note} {said}" if project.note else said
+    return project
+
+
 def parse(ecosystem: str, filename: str, content: str) -> Project | None:
     """Parse lock or manifest content by canonical file name."""
+    project = _parse(ecosystem, filename, content)
+    return _without_credentials(project) if project is not None else None
+
+
+def _parse(ecosystem: str, filename: str, content: str) -> Project | None:
+    """Parse by canonical file name, credentials and all."""
     try:
         if filename in sbom.FORMATS:
             return _read_sbom(ecosystem, filename, content)
@@ -421,6 +529,9 @@ _REQUIREMENT = re.compile(
     r"(?P<op>==|===)\s*(?P<version>[^\s;#]+)"
 )
 _REQUIREMENT_NAME = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)")
+_DIRECT_REFERENCE = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*@\s*\S+\s*(;.*)?$"
+)
 
 
 def _read_requirements(ecosystem: str, source: str, content: str) -> Project | None:
@@ -442,8 +553,11 @@ def _read_requirements(ecosystem: str, source: str, content: str) -> Project | N
             )
             continue
 
-        loose = _REQUIREMENT_NAME.match(line)
-        if loose:
+        direct = _DIRECT_REFERENCE.match(line)
+        if direct:
+            dependencies.append(Dependency(name=direct["name"], version=""))
+        elif _REQUIREMENT_LINE.match(line):
+            loose = _REQUIREMENT_NAME.match(line)
             dependencies.append(Dependency(name=loose["name"], version=""))
         else:
             skipped += 1
@@ -454,6 +568,19 @@ def _read_requirements(ecosystem: str, source: str, content: str) -> Project | N
         dependencies=dependencies,
         skipped=skipped,
     )
+
+
+_NPM_EXACT = re.compile(
+    r"^=?v?(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+def _npm_pinned(spec: object) -> str:
+    """Return the version a `package.json` spec pins, or "" when it pins nothing."""
+    if not isinstance(spec, str):
+        return ""
+    match = _NPM_EXACT.match(spec.strip())
+    return match["version"] if match else ""
 
 
 def _read_package_json(ecosystem: str, source: str, content: str) -> Project | None:
@@ -467,7 +594,7 @@ def _read_package_json(ecosystem: str, source: str, content: str) -> Project | N
         ecosystem=ecosystem,
         source=source,
         dependencies=[
-            Dependency(name=name, version="")
+            Dependency(name=name, version=_npm_pinned(declared[name]))
             for name in sorted(declared)
             if isinstance(name, str)
         ],

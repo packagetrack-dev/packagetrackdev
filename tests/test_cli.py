@@ -2,6 +2,7 @@
 
 import json
 import logging
+import sys
 from pathlib import Path
 
 import pytest
@@ -177,6 +178,236 @@ def test_summarise_keeps_section_heading():
 def test_summarise_version_date_lines(debris):
     assert _summarise(f"{debris}\nFixed a crash on empty input\n") == [
         "Fixed a crash on empty input"
+    ]
+
+
+def test_summarise_drops_a_release_please_version_heading():
+    body = "## 1.5.0 (2026-09-10)\n\n* add auto mode tool permissions\n"
+    assert _summarise(body) == ["add auto mode tool permissions"]
+
+
+def test_summarise_drops_an_rst_anchor():
+    body = ".. _v37-0-3:\n\n* fix a crash when parsing an empty certificate\n"
+    assert _summarise(body) == ["fix a crash when parsing an empty certificate"]
+    assert _summarise(".. _v50-0-0\n\n* drop support for OpenSSL 1.1.1\n") == [
+        "drop support for OpenSSL 1.1.1"
+    ]
+
+
+_CLICK_850_LINKS = (
+    '<p>PyPI: <a href="https://pypi.org/project/click/8.5.0/">'
+    "https://pypi.org/project/click/8.5.0/</a><br>\n"
+    'Changes:  <a href="https://click.palletsprojects.com/page/changes/#version-8-5-0">'
+    "https://click.palletsprojects.com/page/changes/#version-8-5-0</a><br>\n"
+    'Milestone <a href="https://github.com/pallets/click/milestone/33">'
+    "https://github.com/pallets/click/milestone/33</a></p>\n"
+)
+_CLICK_841_ECHO = (
+    "<li>Fix empty byte-string handling in echo. "
+    '<a href="https://github.com/pallets/click/issues/3487">#3487</a></li>\n'
+)
+
+
+def test_summarise_drops_link_labels():
+    body = _CLICK_850_LINKS + "<ul>\n" + _CLICK_841_ECHO + "</ul>\n"
+    assert _summarise(body) == ["Fix empty byte-string handling in echo. #3487"]
+    body = (
+        "  continue to be escaped by the SAX `XMLGenerator`.\n"
+        "  Advisory: https://fluidattacks.com/advisories/mono\n"
+    )
+    assert _summarise(body) == ["continue to be escaped by the SAX XMLGenerator."]
+
+
+def test_summarise_keeps_a_label_with_no_link():
+    body = "Improvements:\n\n- Add ignore for `avoid_as` lint to generated code.\n"
+    assert _summarise(body) == [
+        "Improvements",
+        "Add ignore for avoid_as lint to generated code.",
+    ]
+
+
+def test_summarise_keeps_a_wrapped_word_before_a_url():
+    body = (
+        "  This may contain minor breaking changes so we advise careful testing and\n"
+        "  reviewing https://urllib3.readthedocs.io/en/latest/v2-migration-guide.html\n"
+        "  prior to upgrading.\n"
+    )
+    lines = _summarise(body)
+    assert len(lines) == 1
+    assert "careful testing and reviewing prior" in lines[0]
+
+
+def test_summarise_joins_an_html_wrapped_sentence():
+    body = (
+        "<li>Fix Fish shell completion broken in <code>8.4.0</code> by "
+        '<a href="https://github.com/pallets/click/pull/3126">#3126</a>. '
+        "Newlines and<br>\n"
+        "tabs in option help text are now escaped, keeping the original "
+        "completion<br>\n"
+        "format while still supporting multi-line help. "
+        '<a href="https://github.com/pallets/click/issues/3502">#3502</a><br>\n'
+        '<a href="https://github.com/pallets/click/issues/3043">#3043</a> '
+        '<a href="https://github.com/pallets/click/pull/3504">#3504</a> '
+        '<a href="https://github.com/pallets/click/pull/3508">#3508</a></li>\n'
+    )
+    lines = _summarise(body)
+    assert lines[0] == "Fix Fish shell completion broken in 8.4.0 by #3126."
+    assert lines[1].startswith(
+        "Newlines and tabs in option help text are now escaped, keeping the "
+        "original completion"
+    )
+    body = (
+        "<li>Add built-in shell completion support for PowerShell "
+        "(Windows PowerShell<br>\n"
+        "5.1+ and pwsh 7+) alongside the existing <code>bash</code>, "
+        "<code>zsh</code>, and <code>fish</code><br>\n"
+        "completers. Use <code>_FOO_BAR_COMPLETE=powershell_source foo-bar</code> "
+        "to generate<br>\n"
+        "the completion script. "
+        '<a href="https://github.com/pallets/click/issues/2672">#2672</a> '
+        '<a href="https://github.com/pallets/click/pull/3637">#3637</a></li>\n'
+    )
+    lines = _summarise(body)
+    assert lines[0].startswith(
+        "Add built-in shell completion support for PowerShell "
+        "(Windows PowerShell 5.1+ and pwsh 7+)"
+    )
+    assert lines[1].startswith(
+        "Use _FOO_BAR_COMPLETE=powershell_source foo-bar to generate the completion"
+    )
+
+
+def test_summarise_keeps_html_records_apart():
+    body = (
+        '<li>Fix <a href="https://en.wikipedia.org/wiki/ReDoS">ReDoS</a> in certain '
+        'cases (<a href="https://github.com/chalk/ansi-regex/pull/37">#37</a>)<br>\n'
+        "You are only really affected if you run the regex on untrusted user input "
+        "in a server context, which it's very unlikely anyone is doing, since this "
+        "regex is mainly used in command-line tools.</li>\n"
+    )
+    lines = _summarise(body)
+    assert lines[0] == "Fix ReDoS in certain cases (#37)"
+    assert lines[1].startswith("You are only really affected")
+    body = (
+        '<p>Revert "Revert fast-uri change '
+        '(<a href="https://github.com/ajv-validator/ajv/pull/2444">#2444</a>)" by '
+        '<a href="https://github.com/gurgunday">@gurgunday</a> in '
+        '<a href="https://github.com/ajv-validator/ajv/pull/2448">#2448</a><br>\n'
+        "fix: ignore new eslint error for @typescript-eslint/no-extraneous-class by "
+        '<a href="https://github.com/jasoniangreen">@jasoniangreen</a> in '
+        '<a href="https://github.com/ajv-validator/ajv/pull/2455">#2455</a><br>\n'
+        "docs: clarify behaviour of addVocabulary by "
+        '<a href="https://github.com/jasoniangreen">@jasoniangreen</a> in '
+        '<a href="https://github.com/ajv-validator/ajv/pull/2454">#2454</a><br>\n'
+    )
+    lines = _summarise(body)
+    assert len(lines) == 3
+    assert lines[1].startswith("fix: ignore new eslint error")
+    assert lines[2].startswith("docs: clarify behaviour of addVocabulary")
+
+
+def test_summarise_rst_role_rendered_as_html():
+    body = (
+        "<li>Use :func:<code>shlex.split</code> to split pager and editor "
+        "commands into <code>argv</code><br>\n"
+        "lists for :class:<code>subprocess.Popen</code>, removing "
+        "<code>shell=True</code>.<br>\n"
+        '<a href="https://github.com/pallets/click/issues/1026">#1026</a> '
+        '<a href="https://github.com/pallets/click/pull/1477">#1477</a> '
+        '<a href="https://github.com/pallets/click/pull/2775">#2775</a></li>\n'
+    )
+    assert _summarise(body)[0].startswith(
+        "Use shlex.split to split pager and editor commands into argv lists for "
+        "subprocess.Popen"
+    )
+    body = (
+        "<p>Fixed a race condition in :py:class:<code>~aiohttp.TCPConnector</code> "
+        "where closing the connector while a DNS resolution was in-flight could "
+        "raise :py:exc:<code>AttributeError</code> instead of "
+        ":py:exc:<code>~aiohttp.ClientConnectionError</code> -- by "
+        ":user:<code>goingforstudying-ctrl</code>.</p>\n"
+    )
+    assert _summarise(body)[0].startswith(
+        "Fixed a race condition in TCPConnector where closing the connector"
+    )
+
+
+def test_summarise_keeps_a_role_named_in_prose():
+    body = (
+        "<p>based on the database name alone, where only <code>:memory:</code> "
+        "or an empty<br>\n"
+        "database name indicate a memory database; interpreting the query "
+        "string<br>\n"
+    )
+    line = _summarise(body)[0]
+    assert "memory:" in line
+    assert "or an empty database name" in line
+    body = (
+        "#12562 : Possible typos in using the :user: RST role is now being linted\n"
+        "through the pre-commit tool integration – by @webknjaz .\n"
+    )
+    assert "user: RST role is now being linted" in _summarise(body)[0]
+
+
+def test_summarise_drops_a_version_heading_with_a_written_date():
+    body = (
+        "<h2>0.28.1 (6th December, 2024)</h2>\n<ul>\n"
+        "<li>Fix SSL case where <code>verify=False</code> together with client "
+        "side certificates.</li>\n</ul>\n"
+    )
+    assert _summarise(body) == [
+        "Fix SSL case where verify=False together with client side certificates."
+    ]
+    body = (
+        "<h2>1.0.5 (March 27th, 2024)</h2>\n<ul>\n"
+        "<li>Handle <code>EndOfStream</code> for anyio backend. "
+        '(<a href="https://github.com/encode/httpcore/pull/899">#899</a>)</li>\n'
+    )
+    assert _summarise(body) == ["Handle EndOfStream for anyio backend. (#899)"]
+
+
+def test_summarise_keeps_a_version_line_that_is_not_a_heading():
+    body = "<h2>1.13.0 (Unreleased)</h2>\n<p>UPGRADE NOTES:</p>\n"
+    assert _summarise(body)[0] == "1.13.0 (Unreleased)"
+    body = (
+        "### v1.9.0 (2021-12-31) Changes\n\n"
+        "* Apply `update_forward_refs` to `Config.json_encodes` prevent name "
+        "clashes in types defined via strings, "
+        "[#3583](https://github.com/pydantic/pydantic/pull/3583) by @samuelcolvin\n"
+    )
+    assert _summarise(body)[0] == "v1.9.0 (2021-12-31) Changes"
+
+
+def test_summarise_never_ends_on_a_heading():
+    body = (
+        "### Features\n\n"
+        "* add a --json flag to the report command\n"
+        "* support Python 3.14\n"
+        "* stream large lock files\n"
+        "* read uv.lock workspaces\n\n"
+        "### Bug Fixes\n\n"
+        "* do not crash on an empty uv.lock\n"
+    )
+    assert _summarise(body) == [
+        "Features",
+        "add a --json flag to the report command",
+        "support Python 3.14",
+        "stream large lock files",
+        "read uv.lock workspaces",
+    ]
+    assert _summarise("* fix the parser\n\n### Other changes\n") == ["fix the parser"]
+
+
+def test_summarise_an_issue_reference_is_not_a_heading():
+    body = (
+        "### Bug Fixes\n\n"
+        "-\n#10452 : Fix a race when creating junitxml reports.\n\n"
+        "-\n#10457 : Show the test location for a skip inside a fixture.\n"
+    )
+    assert _summarise(body) == [
+        "Bug Fixes",
+        "10452: Fix a race when creating junitxml reports.",
+        "10457: Show the test location for a skip inside a fixture.",
     ]
 
 
@@ -511,6 +742,43 @@ def test_requirements_txt_unpinned(tmp_path: Path):
     assert project.dependencies[0].version == ""
 
 
+def test_a_requirements_line_counts_only_whole(tmp_path: Path):
+    (tmp_path / "requirements.txt").write_text(
+        "django==5.0\n"
+        "SECRET_KEY=abc123\n"
+        "DEBUG=true\n"
+        "https://example.com/pkg-1.0.whl\n"
+        "git+https://github.com/x/y.git#egg=y\n"
+        "C:\\wheels\\foo.whl\n"
+        "name: value\n"
+        "some words here\n"
+        "requests @ https://example.com/requests-2.32.0.whl\n"
+        'pkg[extra] @ https://example.com/p.whl ; python_version>"3"\n'
+        "flask[async]>=2.0\n"
+        'numpy; python_version<"3.12"\n'
+        "Django >= 4.2, < 5\n"
+        "pytest\n"
+        "attrs==23.1.0 \\\n"
+        "    --hash=sha256:abc\n",
+        encoding="utf-8",
+    )
+    project = read("pypi", tmp_path / "requirements.txt")
+
+    assert [(d.name, d.version) for d in project.dependencies] == [
+        ("django", "5.0"),
+        ("requests", ""),
+        ("pkg", ""),
+        ("flask", ""),
+        ("numpy", ""),
+        ("Django", ""),
+        ("pytest", ""),
+        ("attrs", "23.1.0"),
+    ]
+    assert project.skipped == 8
+    for junk in ("SECRET_KEY", "DEBUG", "https", "git", "C", "name", "some"):
+        assert junk not in {d.name for d in project.dependencies}, junk
+
+
 def test_package_json_fallback(tmp_path: Path):
     (tmp_path / "package.json").write_text(
         json.dumps(
@@ -523,6 +791,61 @@ def test_package_json_fallback(tmp_path: Path):
     project = read("npm", tmp_path / "package.json")
     assert {d.name for d in project.dependencies} == {"expo", "typescript"}
     assert all(d.version == "" for d in project.dependencies)
+
+
+@pytest.mark.parametrize(
+    ("spec", "version"),
+    [
+        ("7.29.0", "7.29.0"),
+        ("=7.29.0", "7.29.0"),
+        ("v7.29.0", "7.29.0"),
+        (" 7.29.0 ", "7.29.0"),
+        ("1.0.0-beta.2", "1.0.0-beta.2"),
+        ("1.2.3+build.5", "1.2.3"),
+        ("^7.29.0", ""),
+        ("~7.29.0", ""),
+        ("7.29.x", ""),
+        ("7.x", ""),
+        ("7.29", ""),
+        ("*", ""),
+        ("", ""),
+        ("latest", ""),
+        (">=7.29.0", ""),
+        ("<8", ""),
+        ("7.29.0 - 8.0.0", ""),
+        ("7.29.0 || 8.0.0", ""),
+        ("npm:undici@7.29.0", ""),
+        ("file:../local", ""),
+        ("git+https://github.com/nodejs/undici.git#v7.29.0", ""),
+        ("workspace:*", ""),
+        ("workspace:7.29.0", ""),
+    ],
+)
+def test_package_json_exact_pin(tmp_path: Path, spec, version):
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"undici-types": spec}})
+    )
+    project = read("npm", tmp_path / "package.json")
+    assert [(d.name, d.version) for d in project.dependencies] == [
+        ("undici-types", version)
+    ]
+
+
+def test_package_json_pins_and_ranges(tmp_path: Path):
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "dependencies": {"undici-types": "7.29.0", "expo": "~54.0.0"},
+                "devDependencies": {"typescript": "5.9.2"},
+            }
+        )
+    )
+    project = read("npm", tmp_path / "package.json")
+    assert {d.name: d.version for d in project.dependencies} == {
+        "expo": "",
+        "typescript": "5.9.2",
+        "undici-types": "7.29.0",
+    }
 
 
 def test_lock_file_beats_manifest(tmp_path: Path):
@@ -652,6 +975,12 @@ def test_config_broken_file(monkeypatch, tmp_path):
     assert settings.server == config.DEFAULT_SERVER
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="chmod cannot restrict group/other read bits on NTFS; group/other "
+    "read on Windows is a filesystem limitation of the saved key, not a "
+    "regression this test can catch there",
+)
 def test_config_file_permissions(monkeypatch, tmp_path):
     import stat
 
@@ -1103,3 +1432,567 @@ def test_snapshot_payload_indirect():
     assert packages["github.com/spf13/afero"]["indirect"] is True
     assert packages["github.com/spf13/afero"]["parents"] == []
     assert packages["github.com/spf13/viper"]["indirect"] is False
+
+
+def _answer(**fields) -> dict:
+    base = {
+        "project": "repro-unmeasured",
+        "stored": 6,
+        "behind": 0,
+        "withdrawn": 0,
+        "unpinned": 0,
+        "url": "/app/projects/repro-unmeasured",
+        "rules": [],
+        "unmeasured_note": None,
+    }
+    return {**base, **fields}
+
+
+class _FakeClient:
+    """An httpx.Client that hands out prepared answers, one per request."""
+
+    def __init__(self, answers):
+        self._answers = list(answers)
+        self.sent = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, url, json=None, headers=None):
+        import httpx
+
+        self.sent.append(json)
+        answer = self._answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        status, body = answer
+        return httpx.Response(status, json=body, request=httpx.Request("POST", url))
+
+
+def _run_check(monkeypatch, capsys, projects, answers, show_all=False):
+    """Run `check` against prepared answers; no socket is opened."""
+    import argparse
+    from types import SimpleNamespace
+
+    import packagetrackdev.__main__ as cli_main
+
+    client = _FakeClient(answers)
+    monkeypatch.setattr(cli_main.httpx, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(cli_main, "_projects_or_exit", lambda folder, eco: projects)
+    monkeypatch.setattr(
+        cli_main.config,
+        "load",
+        lambda **kwargs: SimpleNamespace(api_key=None, server="https://pt.test"),
+    )
+    args = argparse.Namespace(
+        server=None,
+        project=Path("."),
+        ecosystem=None,
+        dry_run=False,
+        all=show_all,
+    )
+    capsys.readouterr()
+    code = cli_main.cmd_check(args)
+    captured = capsys.readouterr()
+    return code, captured, client
+
+
+def _query(monkeypatch, project, answers):
+    """Ask about one project against prepared answers; no socket is opened."""
+    import packagetrackdev.__main__ as cli_main
+
+    client = _FakeClient(answers)
+    monkeypatch.setattr(cli_main.httpx, "Client", lambda **kwargs: client)
+    return cli_main.query("https://pt.test", project)
+
+
+def _project(deps, ecosystem="pypi", source="uv.lock", **fields):
+    from packagetrackdev.lockfiles import Project
+
+    return Project(
+        ecosystem=ecosystem, source=source, dependencies=list(deps), **fields
+    )
+
+
+def _row(name, installed, **fields):
+    base = {
+        "name": name,
+        "ecosystem": "pypi",
+        "installed": installed,
+        "known": True,
+        "installed_known": True,
+        "latest": "2.0.0",
+        "latest_stable": "2.0.0",
+        "versions_behind": 3,
+        "installed_yanked": False,
+        "installed_yanked_reason": None,
+        "installed_deprecated": False,
+        "installed_deprecated_reason": None,
+        "notes": [],
+    }
+    return {**base, **fields}
+
+
+def test_check_keeps_the_answers_a_later_batch_lost(monkeypatch):
+    import httpx
+    import packagetrackdev.__main__ as cli_main
+
+    monkeypatch.setattr(cli_main, "CHUNK", 1)
+    project = _project(
+        [
+            Dependency(name="django", version="4.2.1"),
+            Dependency(name="flask", version="3.0.0"),
+        ]
+    )
+    result = _query(
+        monkeypatch,
+        project,
+        [
+            (200, {"packages": [_row("django", "4.2.1")]}),
+            httpx.ConnectError("no route to host"),
+        ],
+    )
+    kept, lost = result.packages
+    assert (kept.comparison, kept.versions_behind) == ("compared", 3)
+    assert (lost.comparison, lost.versions_behind) == ("not_answered", None)
+    (error,) = result.errors
+    assert error.code == "server_unreachable"
+    assert error.scope["batch"] == {"number": 1, "packages": 1}
+
+
+def test_check_never_reads_an_unmeasured_package_as_current(monkeypatch):
+    project = _project(
+        [
+            Dependency(name="django", version="4.2.1"),
+            Dependency(name="internal-thing", version="1.0.0"),
+            Dependency(name="flask", version=""),
+            Dependency(name="numpy", version="0.0.0+local"),
+        ]
+    )
+    result = _query(
+        monkeypatch,
+        project,
+        [
+            (
+                200,
+                {
+                    "packages": [
+                        _row("django", "4.2.1", versions_behind=0),
+                        _row(
+                            "internal-thing",
+                            "1.0.0",
+                            known=False,
+                            installed_known=False,
+                            latest=None,
+                            latest_stable=None,
+                            versions_behind=None,
+                        ),
+                        _row("flask", "", installed_known=False, versions_behind=None),
+                        _row(
+                            "numpy",
+                            "0.0.0+local",
+                            installed_known=False,
+                            versions_behind=None,
+                        ),
+                    ]
+                },
+            )
+        ],
+    )
+    assert not result.errors
+    states = {
+        p.requested.name: (p.comparison, p.versions_behind) for p in result.packages
+    }
+    assert states == {
+        "django": ("compared", 0),
+        "internal-thing": ("unknown_package", None),
+        "flask": ("unpinned", None),
+        "numpy": ("unplaced_version", None),
+    }
+
+
+def test_check_keeps_two_installed_versions_of_one_package_apart(
+    monkeypatch, tmp_path: Path
+):
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "packages": {
+                    "": {"dependencies": {"glob": "^13.0.0"}},
+                    "node_modules/glob": {"version": "13.0.6"},
+                    "node_modules/rimraf": {"version": "5.0.0"},
+                    "node_modules/rimraf/node_modules/glob": {"version": "7.2.3"},
+                }
+            }
+        )
+    )
+    project = read("npm", tmp_path / "package-lock.json")
+    rows = [
+        _row(dep.name, dep.version, versions_behind=0 if dep.version == "13.0.6" else 9)
+        for dep in project.dependencies
+    ]
+    result = _query(monkeypatch, project, [(200, {"packages": rows})])
+    assert not result.errors
+    globs = [
+        (p.requested.version, p.versions_behind)
+        for p in result.packages
+        if p.name == "glob"
+    ]
+    assert sorted(globs) == [("13.0.6", 0), ("7.2.3", 9)]
+
+
+def test_check_uses_the_name_the_server_normalized(monkeypatch):
+    project = _project([Dependency(name="Flask", version="3.0.0")])
+    result = _query(
+        monkeypatch, project, [(200, {"packages": [_row("flask", "3.0.0")]})]
+    )
+    (package,) = result.packages
+    assert (package.name, package.requested.name) == ("flask", "Flask")
+    assert package.comparison == "compared"
+
+
+def test_check_will_not_pair_an_answer_it_cannot_place(monkeypatch, capsys):
+    project = _project(
+        [
+            Dependency(name="django", version="4.2.1"),
+            Dependency(name="flask", version="3.0.0"),
+        ]
+    )
+    answers = [(200, {"packages": [_row("flask", "3.0.0"), _row("celery", "5.0.0")]})]
+    result = _query(monkeypatch, project, list(answers))
+    states = {p.requested.name: p.comparison for p in result.packages}
+    assert states == {"django": "not_answered", "flask": "compared"}
+    assert [e.code for e in result.errors] == ["unmatched_answers"]
+    code, out, _ = _run_check(monkeypatch, capsys, [project], answers)
+    assert code == 2
+    assert "error:" in out.err
+
+
+def test_check_text_output_is_unchanged(monkeypatch, capsys):
+    project = _project(
+        [
+            Dependency(name="django", version="4.2.1"),
+            Dependency(name="sqlparse", version="0.4.0", parents=["django"]),
+        ]
+    )
+    code, out, _ = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [
+            (
+                200,
+                {
+                    "packages": [
+                        _row(
+                            "django",
+                            "4.2.1",
+                            versions_behind=3,
+                            notes=[{"version": "5.0.0", "body": "Dropped Python 3.8."}],
+                        ),
+                        _row("sqlparse", "0.4.0", versions_behind=1),
+                    ]
+                },
+            )
+        ],
+    )
+    assert code == 0
+    assert out.out.splitlines()[1] == "uv.lock: 2 packages, 1 of them yours."
+    assert "Your dependencies, behind:" in out.out
+    assert "django 4.2.1 -> 2.0.0   3 behind" in out.out
+    assert "    Dropped Python 3.8." in out.out
+    assert "1 packages you did not ask for are also behind." in out.out
+
+
+def test_check_text_says_all_current_only_when_everything_was_compared(
+    monkeypatch, capsys
+):
+    project = _project(
+        [
+            Dependency(name="django", version="4.2.1"),
+            Dependency(name="internal-thing", version="1.0.0"),
+        ]
+    )
+    code, out, _ = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [
+            (
+                200,
+                {
+                    "packages": [
+                        _row("django", "4.2.1", versions_behind=0),
+                        _row(
+                            "internal-thing",
+                            "1.0.0",
+                            known=False,
+                            versions_behind=None,
+                            installed_known=False,
+                        ),
+                    ]
+                },
+            )
+        ],
+    )
+    assert code == 0
+    assert "all current" not in out.out
+    assert "1 of them could not be compared" in out.out
+
+
+def test_check_text_does_not_call_a_withdrawn_dependency_current(monkeypatch, capsys):
+    project = _project([Dependency(name="django", version="4.2.1")])
+    code, out, _ = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [
+            (
+                200,
+                {
+                    "packages": [
+                        _row(
+                            "django",
+                            "4.2.1",
+                            versions_behind=0,
+                            latest="4.2.1",
+                            latest_stable="4.2.1",
+                            installed_yanked=True,
+                            installed_yanked_reason="Breaks on Python 3.13.",
+                        )
+                    ]
+                },
+            )
+        ],
+    )
+    assert code == 0
+    assert "all current" not in out.out
+    assert "Withdrawn versions in this build:" in out.out
+    assert "django 4.2.1  (yours)" in out.out
+    assert "django is withdrawn with no newer release to move to." in out.out
+
+
+def test_check_text_keeps_the_link_in_a_withdrawal_reason(monkeypatch, capsys):
+    reason = "Please see https://eslint.org/version-support for other options."
+    project = _project([Dependency(name="eslint", version="8.57.0")])
+    code, out, _ = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [
+            (
+                200,
+                {
+                    "packages": [
+                        _row(
+                            "eslint",
+                            "8.57.0",
+                            versions_behind=0,
+                            latest="8.57.0",
+                            latest_stable="8.57.0",
+                            installed_yanked=True,
+                            installed_yanked_reason=reason,
+                        )
+                    ]
+                },
+            )
+        ],
+    )
+    assert code == 0
+    assert "https://eslint.org/version-support" in out.out
+    assert reason in out.out
+
+
+def test_check_text_lists_a_deprecated_version_under_its_own_heading(
+    monkeypatch, capsys
+):
+    project = _project([Dependency(name="chalk", version="1.1.2")])
+    code, out, _ = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [
+            (
+                200,
+                {
+                    "packages": [
+                        _row(
+                            "chalk",
+                            "1.1.2",
+                            versions_behind=0,
+                            latest="1.1.2",
+                            latest_stable="1.1.2",
+                            installed_deprecated=True,
+                            installed_deprecated_reason=(
+                                "chalk@1.1.2 introduces breaking changes. "
+                                "Please use 1.1.3 or above."
+                            ),
+                        )
+                    ]
+                },
+            )
+        ],
+    )
+    assert code == 0
+    assert "Deprecated versions in this build:" in out.out
+    assert "Withdrawn versions in this build:" not in out.out
+    assert "chalk 1.1.2  (yours)" in out.out
+    assert "Please use 1.1.3 or above." in out.out
+    assert "all current" in out.out
+
+
+def test_check_text_prints_withdrawals_before_deprecations(monkeypatch, capsys):
+    project = _project(
+        [
+            Dependency(name="chalk", version="1.1.2"),
+            Dependency(name="django", version="4.2.1"),
+        ]
+    )
+    code, out, _ = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [
+            (
+                200,
+                {
+                    "packages": [
+                        _row(
+                            "chalk",
+                            "1.1.2",
+                            versions_behind=0,
+                            installed_deprecated=True,
+                            installed_deprecated_reason="Please use 1.1.3 or above.",
+                        ),
+                        _row(
+                            "django",
+                            "4.2.1",
+                            versions_behind=0,
+                            installed_yanked=True,
+                            installed_yanked_reason="Breaks on Python 3.13.",
+                        ),
+                    ]
+                },
+            )
+        ],
+    )
+    assert code == 0
+    assert out.out.index("Withdrawn versions in this build:") < out.out.index(
+        "Deprecated versions in this build:"
+    )
+    assert "django 4.2.1" in out.out.split("Deprecated versions")[0]
+    assert "chalk 1.1.2" in out.out.split("Deprecated versions")[1]
+
+
+def test_check_text_survives_a_server_that_does_not_know_deprecation(
+    monkeypatch, capsys
+):
+    project = _project([Dependency(name="django", version="4.2.1")])
+    row = _row("django", "4.2.1", versions_behind=0)
+    del row["installed_deprecated"], row["installed_deprecated_reason"]
+    code, out, _ = _run_check(
+        monkeypatch, capsys, [project], [(200, {"packages": [row]})]
+    )
+    assert code == 0
+    assert "Deprecated versions in this build:" not in out.out
+
+
+def test_check_text_names_a_package_whose_version_could_not_be_placed(
+    monkeypatch, capsys
+):
+    project = _project(
+        [
+            Dependency(name="django", version="4.2.12"),
+            Dependency(name="sqlparse", version="0.4.0"),
+        ]
+    )
+    code, out, _ = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [
+            (
+                200,
+                {
+                    "packages": [
+                        _row(
+                            "django",
+                            "4.2.12",
+                            installed_known=False,
+                            versions_behind=None,
+                        ),
+                        _row("sqlparse", "0.4.0", versions_behind=0),
+                    ]
+                },
+            )
+        ],
+    )
+    assert code == 0
+    assert "1 installed version is not one the registry published" in out.out
+    assert "django  installed: 4.2.12" in out.out
+    assert "1 of them could not be compared" in out.out
+
+
+def test_check_text_stops_at_the_first_failure_as_it_always_did(monkeypatch, capsys):
+    import httpx
+
+    project = _project([Dependency(name="django", version="4.2.1")])
+    code, out, _ = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [httpx.ConnectError("no route to host")],
+    )
+    assert code == 2
+    assert out.out == ""
+    assert out.err.startswith("error: could not reach https://pt.test")
+
+
+def test_check_sends_names_and_versions_only(monkeypatch, capsys):
+    project = _project([Dependency(name="django", version="4.2.1", parents=["x"])])
+    _, _, client = _run_check(
+        monkeypatch,
+        capsys,
+        [project],
+        [(200, {"packages": [_row("django", "4.2.1")]})],
+    )
+    assert client.sent == [
+        {"ecosystem": "pypi", "packages": [{"name": "django", "version": "4.2.1"}]}
+    ]
+
+
+def _under_cp1252(argv: list[str]):
+    """Run `python argv...` the way a Windows pipe runs it, on any platform."""
+    import os
+    import subprocess
+
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+    return subprocess.run(
+        [sys.executable, *argv], capture_output=True, env=env, timeout=60
+    )
+
+
+def test_a_real_command_writes_utf8_when_redirected(tmp_path):
+    """Under cp1252 "…" used to leave as the single byte 0x85."""
+    missing = tmp_path / "café…"
+    result = _under_cp1252(
+        ["-m", "packagetrackdev", "check", "--project", str(missing)]
+    )
+    assert result.returncode == 2
+    assert "café…".encode() in result.stderr
+    result.stderr.decode("utf-8")
+
+
+def test_stdout_is_utf8_too_when_redirected():
+    code = "; ".join(
+        [
+            "from packagetrackdev.__main__ import _utf8_output",
+            "_utf8_output()",
+            "print('clipped note…')",
+        ]
+    )
+    result = _under_cp1252(["-c", code])
+    assert result.stdout.strip() == "clipped note…".encode()

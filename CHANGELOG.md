@@ -5,6 +5,25 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-13
+
+### Added
+
+- `check` lists deprecated versions under their own heading, after withdrawn ones.
+
+### Changed
+
+- `check` gives every requested package its own result: compared, unknown, unpinned, a version the registry never published, or not answered.
+  Two installed versions of one package no longer collapse into one.
+
+### Fixed
+
+- A requirements line counts only when the whole line is one: `SECRET_KEY=...`, a wheel URL or a Windows path is no longer read as a dependency.
+- A dependency name shaped like an access token or API key is never sent; it is counted as skipped.
+- An exact version in package.json (`7.29.0`) is read as the pin npm treats it as, not as unpinned.
+- A withdrawal reason keeps its link instead of losing it as a changelog trailer.
+- Release excerpts drop reStructuredText anchors and link labels, and no longer end on a bare heading.
+
 ## [0.2.2] - 2026-09-17
 
 ### Fixed

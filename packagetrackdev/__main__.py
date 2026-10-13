@@ -13,6 +13,7 @@ import httpx
 from packagetrackdev import config
 
 from packagetrackdev.excerpt import NOTES_SHOWN
+from packagetrackdev.excerpt import clip as _clip
 from packagetrackdev.excerpt import summarise as _summarise
 from packagetrackdev.lockfiles import (
     LOCKFILES,
@@ -23,6 +24,21 @@ from packagetrackdev.lockfiles import (
 )
 from packagetrackdev.lockfiles import (
     ecosystems as lockfile_ecosystems,
+)
+from packagetrackdev.results import (
+    COMPARED,
+    MALFORMED_ANSWER,
+    NOT_ANSWERED,
+    SERVER_REJECTED,
+    SERVER_UNREACHABLE,
+    UNKNOWN_PACKAGE,
+    UNMATCHED_ANSWERS,
+    UNPINNED,
+    UNPLACED_VERSION,
+    PackageResult,
+    ProjectResult,
+    Requested,
+    RunError,
 )
 
 REQUEST_TIMEOUT = 60.0
@@ -132,27 +148,46 @@ def project_name(project: Project, given: str | None, folder: Path, many: bool) 
     return f"{base}-{project.ecosystem}" if many and not given else base
 
 
-def report(project: Project, data: dict, show_all: bool) -> None:
+def _flagged_block(heading: str, packages: list[PackageResult], attr: str) -> None:
+    """Print one "these installed versions carry a flag" list.
+
+    Withdrawn and deprecated read the same way -- name, whose dependency it
+    is, what the registry said -- and differ only in the heading and in which
+    reason is printed. One loop so the two lists cannot drift apart in
+    wording; the ordering and the sentences around them are the caller's.
+    """
+    print(heading)
+    for pkg in packages:
+        reason = (getattr(pkg, attr) or "no reason given").strip()
+        owners = pkg.requested.parents
+        if owners:
+            via = f"  (pulled in by {', '.join(owners[:3])})"
+        elif not pkg.requested.direct:
+            via = "  (indirect, this file does not record what requires it)"
+        else:
+            via = "  (yours)"
+        print(f"  {pkg.name} {pkg.requested.version}{via}")
+        print(f"      {_clip(reason)}")
+    print()
+
+
+def report(result: ProjectResult, show_all: bool) -> None:
     """Print the report for one project."""
-    by_name = {p["name"]: p for p in data.get("packages", [])}
-    parents = {d.name: d.parents for d in project.dependencies}
-    transitive = {d.name for d in project.dependencies if not d.direct}
+    own = [p for p in result.packages if p.requested.direct]
+    direct = [p for p in own if p.behind > 0]
+    withdrawn = [p for p in result.packages if p.withdrawn]
+    deprecated = [p for p in result.packages if p.deprecated]
+    own_withdrawn = [p for p in own if p.withdrawn and p.behind == 0]
+    unknown = [p for p in result.packages if p.comparison == UNKNOWN_PACKAGE]
+    unpinned = [p for p in result.packages if p.comparison == UNPINNED]
+    unplaced = [p for p in result.packages if p.comparison == UNPLACED_VERSION]
 
-    direct = [
-        by_name[d.name]
-        for d in project.direct
-        if d.name in by_name and (by_name[d.name].get("versions_behind") or 0) > 0
-    ]
-    withdrawn = [p for p in data.get("packages", []) if p.get("installed_yanked")]
-    unknown = [p for p in data.get("packages", []) if not p.get("known")]
-
-    unpinned = [d for d in project.dependencies if not d.version]
     print(
-        f"\n{project.source}: {data.get('checked', 0)} packages, "
-        f"{len(project.direct)} of them yours.\n"
+        f"\n{result.source}: {sum(1 for p in result.packages if p.answered)} "
+        f"packages, {len(own)} of them yours.\n"
     )
-    if project.note:
-        print(f"{project.note}\n")
+    if result.note:
+        print(f"{result.note}\n")
     if unpinned:
         one = len(unpinned) == 1
         print(
@@ -160,48 +195,73 @@ def report(project: Project, data: dict, show_all: bool) -> None:
             f"{'a version' if one else 'versions'}, so how far behind "
             f"{'it is' if one else 'they are'} depends on when you last built."
         )
-        for dep in unpinned[:8]:
-            pkg = by_name.get(dep.name) or {}
-            newest = pkg.get("latest_stable")
-            print(f"  {dep.name}  newest release: {newest or 'unknown to us'}")
+        for pkg in unpinned[:8]:
+            newest = pkg.latest_stable
+            print(
+                f"  {pkg.requested.name}  newest release: {newest or 'unknown to us'}"
+            )
         if len(unpinned) > 8:
             print(f"  ...and {len(unpinned) - 8} more")
         print()
 
-    if withdrawn:
-        print("Withdrawn versions in this build:")
-        for pkg in withdrawn:
-            reason = (pkg.get("installed_yanked_reason") or "no reason given").strip()
-            owners = parents.get(pkg["name"]) or []
-            if owners:
-                via = f"  (pulled in by {', '.join(owners[:3])})"
-            elif pkg["name"] in transitive:
-                via = "  (indirect, this file does not record what requires it)"
-            else:
-                via = "  (yours)"
-            print(f"  {pkg['name']} {pkg['installed']}{via}")
-            for line in _summarise(reason)[:2]:
-                print(f"      {line}")
+    if unplaced:
+        one = len(unplaced) == 1
+        print(
+            f"{len(unplaced)} installed "
+            f"{'version is not one' if one else 'versions are not ones'} the "
+            f"registry published, so we could not say how far behind "
+            f"{'it is' if one else 'they are'}."
+        )
+        for pkg in unplaced[:8]:
+            installed = pkg.requested.version or "no version recorded"
+            print(f"  {pkg.name or pkg.requested.name}  installed: {installed}")
+        if len(unplaced) > 8:
+            print(f"  ...and {len(unplaced) - 8} more")
         print()
+
+    if withdrawn:
+        _flagged_block(
+            "Withdrawn versions in this build:", withdrawn, "withdrawn_reason"
+        )
+
+    if deprecated:
+        _flagged_block(
+            "Deprecated versions in this build:", deprecated, "deprecated_reason"
+        )
 
     if direct:
         print("Your dependencies, behind:")
-        for pkg in sorted(direct, key=lambda p: -(p.get("versions_behind") or 0)):
+        for pkg in sorted(direct, key=lambda p: -p.behind):
             print(
-                f"\n{pkg['name']} {pkg['installed']} -> {pkg.get('latest_stable')}"
-                f"   {pkg['versions_behind']} behind"
+                f"\n{pkg.name} {pkg.requested.version} -> {pkg.latest_stable}"
+                f"   {pkg.versions_behind} behind"
             )
-            for note in pkg.get("notes", [])[:NOTES_SHOWN]:
+            for note in pkg.notes[:NOTES_SHOWN]:
                 print(f"  {note['version']}")
                 for line in _summarise(note["body"]):
                     print(f"    {line}")
+    elif all(p.comparison == COMPARED for p in own):
+        if not withdrawn:
+            print("Your own dependencies are all current.")
+        elif own_withdrawn:
+            one = len(own_withdrawn) == 1
+            names = ", ".join(p.name or p.requested.name for p in own_withdrawn)
+            print(
+                f"{names} {'is' if one else 'are'} withdrawn with no newer "
+                f"release to move to. Your other direct dependencies have no "
+                f"version gap."
+            )
+        else:
+            print("Your own direct dependencies have no version gap.")
     else:
-        print("Your own dependencies are all current.")
+        unmeasured = sum(1 for p in own if p.comparison != COMPARED)
+        print(
+            f"None of your own dependencies came back behind, and "
+            f"{unmeasured} of them could not be compared."
+        )
 
     behind_indirect = sum(
-        1
-        for p in data.get("packages", [])
-        if (p.get("versions_behind") or 0) > 0 and p["name"] in transitive
+        1 for p in result.packages if p.behind > 0 and not p.requested.direct
     )
     if behind_indirect:
         print(
@@ -211,25 +271,152 @@ def report(project: Project, data: dict, show_all: bool) -> None:
 
     if show_all and unknown:
         print("\nNot in the archive (we track the most-depended-on per registry):")
-        print("  " + ", ".join(p["name"] for p in unknown[:40]))
+        print("  " + ", ".join(p.requested.name for p in unknown[:40]))
 
 
-def ask(server: str, ecosystem: str, packages: list[Dependency]) -> dict:
-    """Query the server in chunks and merge the responses."""
+def requested_for(project: Project) -> list[Requested]:
+    """Number the project's dependencies, so an answer has something to land on."""
+    return [
+        Requested(
+            index=i,
+            name=d.name,
+            version=d.version,
+            parents=list(d.parents),
+            indirect=d.indirect,
+        )
+        for i, d in enumerate(project.dependencies)
+    ]
+
+
+def state_for(requested: Requested, row: dict) -> PackageResult:
+    """Turn one answer row into a result, and name what it could not say."""
+    result = PackageResult(
+        requested=requested,
+        comparison=COMPARED,
+        answered=True,
+        name=row.get("name") or requested.name,
+        latest=row.get("latest"),
+        latest_stable=row.get("latest_stable"),
+        withdrawn=bool(row.get("installed_yanked")),
+        withdrawn_reason=row.get("installed_yanked_reason"),
+        deprecated=bool(row.get("installed_deprecated")),
+        deprecated_reason=row.get("installed_deprecated_reason"),
+        notes=list(row.get("notes") or []),
+    )
+    behind = row.get("versions_behind")
+    placed = row.get("installed_known")
+    if placed is None:
+        placed = behind is not None
+
+    if not requested.version:
+        result.comparison = UNPINNED
+    elif not row.get("known"):
+        result.comparison = UNKNOWN_PACKAGE
+    elif not placed or behind is None:
+        result.comparison = UNPLACED_VERSION
+    else:
+        result.versions_behind = int(behind)
+    return result
+
+
+def place(batch: list[Requested], rows: list[dict]) -> tuple[list[PackageResult], int]:
+    """Tie each answer to the request it belongs to; return what would not tie."""
+    if len(rows) == len(batch) and all(
+        str(row.get("installed", "")) == req.version
+        for req, row in zip(batch, rows, strict=True)
+    ):
+        return [state_for(req, row) for req, row in zip(batch, rows, strict=True)], 0
+
+    spare: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        key = (str(row.get("name", "")), str(row.get("installed", "")))
+        spare.setdefault(key, []).append(row)
+
+    placed = []
+    for req in batch:
+        for key in ((req.name, req.version), (req.name.casefold(), req.version)):
+            if spare.get(key):
+                placed.append(state_for(req, spare[key].pop(0)))
+                break
+    return placed, sum(len(rest) for rest in spare.values())
+
+
+def query(server: str, project: Project) -> ProjectResult:
+    """Ask the server about one project, keeping whatever answers arrive."""
     url = f"{server.rstrip('/')}/api/status"
-    merged: dict = {"ecosystem": ecosystem, "checked": 0, "behind": 0, "packages": []}
+    batches = requested_for(project)
+    result = ProjectResult(
+        ecosystem=project.ecosystem,
+        source=project.source,
+        skipped=project.skipped,
+        note=project.note,
+        packages=[PackageResult(requested=r, comparison=NOT_ANSWERED) for r in batches],
+    )
 
     with httpx.Client(timeout=REQUEST_TIMEOUT, headers=_user_agent()) as client:
-        for start in range(0, len(packages), CHUNK):
-            batch = packages[start : start + CHUNK]
-            response = client.post(url, json=payload(ecosystem, batch))
-            response.raise_for_status()
-            part = response.json()
-            merged["checked"] += part.get("checked", 0)
-            merged["behind"] += part.get("behind", 0)
-            merged["packages"].extend(part.get("packages", []))
+        for number, start in enumerate(range(0, len(batches), CHUNK)):
+            batch = batches[start : start + CHUNK]
+            scope = {
+                "source": project.source,
+                "ecosystem": project.ecosystem,
+                "batch": {"number": number, "packages": len(batch)},
+            }
+            try:
+                response = client.post(url, json=payload(project.ecosystem, batch))
+                response.raise_for_status()
+                rows = response.json().get("packages") or []
+            except httpx.HTTPError as exc:
+                result.errors.append(request_error(exc, server, scope))
+                continue
+            except ValueError:
+                result.errors.append(
+                    RunError(
+                        code=MALFORMED_ANSWER,
+                        scope=scope,
+                        message="the server's answer could not be read",
+                        detail=f"{server} answered with something that is not JSON",
+                    )
+                )
+                continue
 
-    return merged
+            answers, unmatched = place(batch, rows)
+            for answer in answers:
+                result.packages[answer.requested.index] = answer
+            if unmatched:
+                result.errors.append(
+                    RunError(
+                        code=UNMATCHED_ANSWERS,
+                        scope=scope,
+                        message=(
+                            f"{unmatched} answers could not be matched to a "
+                            f"requested package"
+                        ),
+                        detail=(
+                            f"{server} answered for {unmatched} packages that "
+                            f"were not asked about; they were ignored"
+                        ),
+                    )
+                )
+
+    return result
+
+
+def request_error(exc: httpx.HTTPError, server: str, scope: dict) -> RunError:
+    """Describe a failed request: a code to branch on, a sentence for a person."""
+    detail = http_failure(exc, server)
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return RunError(
+            code=SERVER_UNREACHABLE,
+            scope=scope,
+            message="the server could not be reached",
+            detail=detail,
+        )
+    return RunError(
+        code=SERVER_REJECTED,
+        scope={**scope, "http_status": exc.response.status_code},
+        message=f"the server answered HTTP {exc.response.status_code}",
+        detail=detail,
+    )
 
 
 def _projects_or_exit(folder: Path, ecosystem: str | None) -> list[Project]:
@@ -259,12 +446,11 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 0
 
     for project in projects:
-        try:
-            data = ask(settings.server, project.ecosystem, project.dependencies)
-        except httpx.HTTPError as exc:
-            print(f"error: {http_failure(exc, settings.server)}", file=sys.stderr)
+        result = query(settings.server, project)
+        if result.errors:
+            print(f"error: {result.errors[0].detail}", file=sys.stderr)
             return 2
-        report(project, data, show_all=args.all)
+        report(result, show_all=args.all)
     return 0
 
 
@@ -421,7 +607,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _utf8_output() -> None:
+    """Write stdout and stderr as UTF-8, whatever the platform's default is."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 def main() -> int:
+    _utf8_output()
     args = build_parser().parse_args()
     try:
         return args.func(args)
