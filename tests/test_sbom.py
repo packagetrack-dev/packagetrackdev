@@ -92,7 +92,7 @@ def text(document) -> str:
         ("pkg:pypi/flask@3.0.0", ("pypi", "flask", "3.0.0")),
         ("pkg:npm/%40types/node@22.0.0", ("npm", "@types/node", "22.0.0")),
         ("pkg:cargo/serde@1.0.0?arch=x86", ("cargo", "serde", "1.0.0")),
-        ("pkg:golang/github.com/x/y@v1.2.3", ("golang", "github.com/x/y", "v1.2.3")),
+        ("pkg:golang/github.com/x/y@v1.2.3", ("go", "github.com/x/y", "v1.2.3")),
         ("pkg:PyPI/Flask@3.0.0", ("pypi", "Flask", "3.0.0")),
     ],
 )
@@ -149,7 +149,7 @@ def test_spdx_components():
     flask, werkzeug = reading.components
     assert flask.direct and not werkzeug.direct
     assert werkzeug.parents == ["flask"]
-    assert reading.skipped == 1
+    assert reading.skipped == 0
 
 
 def test_component_without_purl():
@@ -241,3 +241,156 @@ def test_skipped_count_in_project():
     document["components"].append({"type": "file", "name": "README"})
     project = lockfiles.parse("pypi", sbom.CYCLONEDX, json.dumps(document))
     assert project.skipped == 1
+
+
+_GO_CYCLONEDX = {
+    "bomFormat": "CycloneDX",
+    "specVersion": "1.5",
+    "components": [
+        {
+            "type": "library",
+            "name": "github.com/google/uuid",
+            "version": "v1.6.0",
+            "purl": "pkg:golang/github.com/google/uuid@v1.6.0",
+        },
+        {
+            "type": "library",
+            "name": "golang.org/x/net",
+            "version": "v0.20.0",
+            "purl": "pkg:golang/golang.org/x/net@v0.20.0",
+        },
+    ],
+}
+_GO_SPDX = {
+    "spdxVersion": "SPDX-2.3",
+    "packages": [
+        {
+            "name": "uuid",
+            "versionInfo": "v1.6.0",
+            "externalRefs": [
+                {
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": "pkg:golang/github.com/google/uuid@v1.6.0",
+                }
+            ],
+        }
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("document", "fmt"), [(_GO_CYCLONEDX, sbom.CYCLONEDX), (_GO_SPDX, sbom.SPDX)]
+)
+def test_a_go_sbom_is_the_go_ecosystem(document, fmt):
+    content = json.dumps(document)
+    assert lockfiles.detect(content) == ("go", fmt)
+    project = lockfiles.parse("go", fmt, content)
+    assert project.ecosystem == "go"
+    assert ("github.com/google/uuid", "v1.6.0") in {
+        (d.name, d.version) for d in project.dependencies
+    }
+
+
+def test_parse_purl_scope_left_unencoded():
+    assert sbom.parse_purl("pkg:npm/@types/node@20.1.0") == (
+        "npm",
+        "@types/node",
+        "20.1.0",
+    )
+    assert sbom.parse_purl("pkg:npm/@types/node") is None
+
+
+def _spdx_package(ref, name, version):
+    return {
+        "SPDXID": f"SPDXRef-{ref}",
+        "name": name,
+        "versionInfo": version,
+        "externalRefs": [
+            {
+                "referenceCategory": "PACKAGE-MANAGER",
+                "referenceType": "purl",
+                "referenceLocator": f"pkg:npm/{name}@{version}",
+            }
+        ],
+    }
+
+
+def _spdx(*relationships):
+    return {
+        "spdxVersion": "SPDX-2.3",
+        "packages": [
+            _spdx_package("root", "myapp", "1.0.0"),
+            _spdx_package("a", "express", "4.18.2"),
+            _spdx_package("b", "debug", "2.6.9"),
+        ],
+        "relationships": [
+            {
+                "spdxElementId": "SPDXRef-DOCUMENT",
+                "relationshipType": "DESCRIBES",
+                "relatedSpdxElement": "SPDXRef-root",
+            },
+            *(
+                {
+                    "spdxElementId": f"SPDXRef-{a}",
+                    "relationshipType": kind,
+                    "relatedSpdxElement": f"SPDXRef-{b}",
+                }
+                for a, kind, b in relationships
+            ),
+        ],
+    }
+
+
+def _rows(document):
+    reading = sbom.read(json.dumps(document))
+    rows = {c.name: (c.direct, c.parents) for c in reading.components}
+    return rows, sbom.caveat(reading)
+
+
+@pytest.mark.parametrize(
+    "relationships",
+    [
+        [("root", "DEPENDS_ON", "a"), ("a", "DEPENDS_ON", "b")],
+        [("a", "DEPENDENCY_OF", "root"), ("b", "DEPENDENCY_OF", "a")],
+        [("a", "RUNTIME_DEPENDENCY_OF", "root"), ("b", "DEPENDENCY_OF", "a")],
+    ],
+    ids=["depends_on", "dependency_of", "runtime_dependency_of"],
+)
+def test_spdx_the_described_package_is_the_project(relationships):
+    rows, caveat = _rows(_spdx(*relationships))
+    assert rows == {"express": (True, []), "debug": (False, ["express"])}
+    assert caveat is None
+
+
+def test_spdx_a_graph_of_contains_demotes_nothing_and_says_so():
+    rows, caveat = _rows(_spdx(("root", "CONTAINS", "a"), ("root", "CONTAINS", "b")))
+    assert rows == {"express": (True, []), "debug": (True, [])}
+    assert caveat is not None and "directly" in caveat
+
+
+def _cyclonedx(graph, listed_root=False):
+    root = {"bom-ref": "root", "name": "myapp", "purl": "pkg:npm/myapp@1.0.0"}
+    components = [
+        {"bom-ref": "a", "name": "express", "purl": "pkg:npm/express@4.18.2"},
+        {"bom-ref": "b", "name": "debug", "purl": "pkg:npm/debug@2.6.9"},
+    ]
+    return {
+        "bomFormat": "CycloneDX",
+        "metadata": {"component": root},
+        "components": ([dict(root)] if listed_root else []) + components,
+        "dependencies": graph,
+    }
+
+
+def test_cyclonedx_the_root_listed_as_a_component_is_not_a_row():
+    graph = [{"ref": "root", "dependsOn": ["a"]}, {"ref": "a", "dependsOn": ["b"]}]
+    rows, caveat = _rows(_cyclonedx(graph, listed_root=True))
+    assert rows == {"express": (True, []), "debug": (False, ["express"])}
+    assert caveat is None
+
+
+def test_cyclonedx_a_root_missing_from_the_graph_demotes_nothing():
+    rows, caveat = _rows(_cyclonedx([{"ref": "a", "dependsOn": ["b"]}]))
+    assert rows == {"express": (True, []), "debug": (True, ["express"])}
+    assert caveat is not None

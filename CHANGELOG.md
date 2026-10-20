@@ -5,6 +5,23 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-20
+
+### Changed
+
+- `push` says when it made a new project and how many dependencies it could not compare, instead of "0 behind".
+
+### Fixed
+
+- A UTF-16 file (PowerShell's `pip freeze > requirements.txt`) or a UTF-8 file with a BOM is read; the first requirement is no longer dropped.
+- A lock file of an unexpected shape is refused with a message instead of crashing.
+- `requirements.txt`: `a===1.0` keeps its version, and `a==1.0,<2` or `a==1.*` is a range, not a version. A hash continuation line no longer joins the version.
+- npm workspaces are read as the project: their folders are no longer dependencies, and their own dependencies count as declared.
+- npm edges resolve the way Node does, so a nested copy of a package keeps its own parent and version.
+- `Cargo.lock` and `uv.lock` keep every version of a package (`syn` 1 beside `syn` 2, a package forked by marker).
+- A Go SBOM (`pkg:golang/...`) is read as the go ecosystem instead of being refused.
+- The package an SBOM describes is no longer listed as its own dependency, and SPDX `*_DEPENDENCY_OF` relations are read.
+
 ## [0.3.0] - 2026-10-13
 
 ### Added
@@ -66,7 +83,10 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - First release: `check`, `push`, `login`, `mcp`.
 
-[Unreleased]: https://github.com/packagetrack-dev/packagetrackdev/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/packagetrack-dev/packagetrackdev/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/packagetrack-dev/packagetrackdev/releases/tag/v0.3.1
+[0.3.0]: https://github.com/packagetrack-dev/packagetrackdev/releases/tag/v0.3.0
+[0.2.2]: https://github.com/packagetrack-dev/packagetrackdev/releases/tag/v0.2.2
 [0.2.1]: https://github.com/packagetrack-dev/packagetrackdev/releases/tag/v0.2.1
 [0.2.0]: https://github.com/packagetrack-dev/packagetrackdev/releases/tag/v0.2.0
 [0.1.2]: https://github.com/packagetrack-dev/packagetrackdev/releases/tag/v0.1.2

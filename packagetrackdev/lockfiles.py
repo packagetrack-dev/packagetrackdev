@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import re
@@ -9,7 +10,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from packagetrackdev import sbom
+from . import sbom
 
 log = logging.getLogger(__name__)
 
@@ -74,15 +75,18 @@ DECLARATIONS = frozenset(name for _, name in MANIFESTS)
 
 SUPPORTED_FILES = tuple(name for _, name in (*LOCKFILES, *MANIFESTS))
 
+_OPERATOR = r"(===|==|!=|<=?|>=?|~=)"
+_CLAUSE = _OPERATOR + r"\s*[^\s;,=][^\s;,]*"
 _REQUIREMENT_LINE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(\[[^\]]*\])?\s*"
-    r"((==|===|!=|<=?|>=?|~=)\s*[^\s;,]+(\s*,\s*(==|===|!=|<=?|>=?|~=)\s*[^\s;,]+)*)?"
+    r"(" + _CLAUSE + r"(\s*,\s*" + _CLAUSE + r")*)?"
     r"\s*(;.*)?$"
 )
 
 
 def detect(content: str, filename: str | None = None) -> tuple[str, str] | None:
     """Detect the file type of `content`, as (ecosystem, canonical name)."""
+    content = content.removeprefix(_BOM)
     if filename:
         base = filename.replace("\\", "/").rsplit("/", 1)[-1]
         for ecosystem, name in (*LOCKFILES, *MANIFESTS):
@@ -138,7 +142,7 @@ def detect(content: str, filename: str | None = None) -> tuple[str, str] | None:
     lines = [
         stripped
         for raw in content.splitlines()
-        if (stripped := raw.split("#", 1)[0].strip())
+        if (stripped := _requirement_text(raw))
     ]
     candidates = [line for line in lines if not line.startswith("-")]
     if candidates and all(_REQUIREMENT_LINE.match(line) for line in candidates):
@@ -161,7 +165,7 @@ NOT_THIS_SUFFIX = "not_this_suffix"
 NOT_NAMED_REQUIREMENTS = "not_named_requirements"
 UNPINNED_UNNAMED = "unpinned_unnamed"
 
-_SPECIFIER = re.compile(r"(==|===|!=|<=?|>=?|~=)")
+_SPECIFIER = re.compile(_OPERATOR)
 
 
 def may_open(filename: str) -> bool:
@@ -199,11 +203,30 @@ def refusal(
     return None
 
 
+_BOM = chr(0xFEFF)  # a byte order mark once decoded
+
+
+def decode(raw: bytes) -> str | None:
+    """Decode a dependency file's bytes, or None when they are not text."""
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    else:
+        encoding = "utf-8-sig"
+    try:
+        return raw.decode(encoding)
+    except UnicodeDecodeError:
+        return None
+
+
 def read(ecosystem: str, path: Path) -> Project | None:
     try:
-        content = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError as exc:
         log.warning("could not read %s: %s", path, exc)
+        return None
+    content = decode(raw)
+    if content is None:
+        log.warning("could not read %s: not UTF-8 or marked UTF-16 text", path)
         return None
     return parse(ecosystem, path.name, content)
 
@@ -289,6 +312,7 @@ def parse(ecosystem: str, filename: str, content: str) -> Project | None:
 
 def _parse(ecosystem: str, filename: str, content: str) -> Project | None:
     """Parse by canonical file name, credentials and all."""
+    content = content.removeprefix(_BOM)
     try:
         if filename in sbom.FORMATS:
             return _read_sbom(ecosystem, filename, content)
@@ -308,11 +332,29 @@ def _parse(ecosystem: str, filename: str, content: str) -> Project | None:
     except (ValueError, tomllib.TOMLDecodeError) as exc:
         log.warning("could not parse %s: %s", filename, exc)
         return None
+    except (AttributeError, TypeError, KeyError) as exc:
+        log.warning("could not parse %s: unexpected shape: %r", filename, exc)
+        return None
+
+
+def _mapping(value: object) -> dict:
+    """Return `value` when it is a JSON object, an empty one otherwise."""
+    return value if isinstance(value, dict) else {}
+
+
+_NPM_DEPENDENCY_FIELDS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
 
 
 def _read_npm(ecosystem: str, source: str, content: str) -> Project | None:
     """Parse `package-lock.json` (v2 and v3)."""
     data = json.loads(content)
+    if not isinstance(data, dict):
+        return None
     entries = data.get("packages")
     if not isinstance(entries, dict):
         return None
@@ -331,36 +373,57 @@ def _read_npm(ecosystem: str, source: str, content: str) -> Project | None:
     def resolve(spelling: str) -> str:
         return real_name.get(spelling, spelling)
 
-    root = entries.get("", {})
-    declared = {
-        resolve(name)
-        for name in (*root.get("dependencies", {}), *root.get("devDependencies", {}))
-    }
+    def lands_on(origin: str, spelling: str) -> str | None:
+        folder = origin
+        while True:
+            prefix = f"{folder}/" if folder else ""
+            candidate = f"{prefix}node_modules/{spelling}"
+            if candidate in entries:
+                return candidate
+            if not folder:
+                return None
+            folder = folder.rsplit("/", 1)[0] if "/" in folder else ""
 
-    installed: dict[str, str] = {}
-    parents: dict[str, set[str]] = {}
+    direct: set[str] = set()
+    for location, meta in entries.items():
+        if location and "node_modules/" in location:
+            continue
+        meta = _mapping(meta)
+        for kind in _NPM_DEPENDENCY_FIELDS:
+            for spelling in _mapping(meta.get(kind)):
+                target = lands_on(location, spelling)
+                if target is not None:
+                    direct.add(target)
+
+    rows: dict[str, tuple[str, str]] = {}
+    row_of: dict[str, str] = {}
     skipped = 0
 
     for location, meta in entries.items():
-        if not location:
+        if not location or "node_modules/" not in location:
             continue
-        name = resolve(location.split("node_modules/")[-1])
         version = meta.get("version") if isinstance(meta, dict) else None
         if not isinstance(version, str):
             skipped += 1
             continue
-        installed.setdefault(f"{name}@{version}", version)
-        for dependency in (
-            *meta.get("dependencies", {}),
-            *meta.get("peerDependencies", {}),
-            *meta.get("optionalDependencies", {}),
-        ):
-            parents.setdefault(resolve(dependency), set()).add(name)
+        name = resolve(location.split("node_modules/")[-1])
+        key = f"{name}@{version}"
+        rows.setdefault(key, (name, version))
+        row_of[location] = key
 
+    parents: dict[str, set[str]] = {}
+    for location, key in row_of.items():
+        meta = entries[location]
+        for kind in ("dependencies", "peerDependencies", "optionalDependencies"):
+            for spelling in _mapping(meta.get(kind)):
+                target = lands_on(location, spelling)
+                if target in row_of:
+                    parents.setdefault(row_of[target], set()).add(rows[key][0])
+
+    is_direct = {row_of[location] for location in direct if location in row_of}
     out: list[Dependency] = []
-    for key, version in installed.items():
-        name = key.rsplit("@", 1)[0]
-        owners = [] if name in declared else sorted(parents.get(name, ()))
+    for key, (name, version) in rows.items():
+        owners = [] if key in is_direct else sorted(parents.get(key, ()))
         out.append(Dependency(name=name, version=version, parents=owners))
 
     return Project(
@@ -375,9 +438,8 @@ def _read_cargo(ecosystem: str, source: str, content: str) -> Project | None:
     if not isinstance(packages, list):
         return None
 
-    local: set[str] = set()
-    versions: dict[str, str] = {}
-    parents: dict[str, set[str]] = {}
+    entries: list[tuple[str, str | None, bool, list]] = []
+    by_name: dict[str, list[str]] = {}
     skipped = 0
 
     for entry in packages:
@@ -385,16 +447,41 @@ def _read_cargo(ecosystem: str, source: str, content: str) -> Project | None:
             skipped += 1
             continue
         name, version = entry["name"], entry.get("version")
+        version = version if isinstance(version, str) else None
+        is_local = not entry.get("source")
+        deps = entry.get("dependencies")
+        deps = deps if isinstance(deps, list) else []
+        entries.append((name, version, is_local, deps))
+        if not is_local and version is not None:
+            by_name.setdefault(name, []).append(version)
 
-        if not entry.get("source"):
-            local.add(name)
-        elif isinstance(version, str):
-            versions[name] = version
+    def targets(reference: object) -> list[tuple[str, str]]:
+        if not isinstance(reference, str) or not reference:
+            return []
+        name, _, rest = reference.partition(" ")
+        known = by_name.get(name, [])
+        wanted = rest.split(" ", 1)[0]
+        if wanted:
+            return [(name, wanted)] if wanted in known else []
+        return [(name, version) for version in known]
 
-        for dep in entry.get("dependencies") or []:
-            if isinstance(dep, str):
-                parents.setdefault(dep.split(" ", 1)[0], set()).add(name)
+    direct: set[tuple[str, str]] = set()
+    parents: dict[tuple[str, str], set[str]] = {}
+    for name, _version, is_local, deps in entries:
+        for reference in deps:
+            for target in targets(reference):
+                if is_local:
+                    direct.add(target)
+                else:
+                    parents.setdefault(target, set()).add(name)
 
+    rows = sorted(
+        {
+            (name, version)
+            for name, version, is_local, _ in entries
+            if not is_local and version is not None
+        }
+    )
     return Project(
         ecosystem=ecosystem,
         source=source,
@@ -402,9 +489,11 @@ def _read_cargo(ecosystem: str, source: str, content: str) -> Project | None:
             Dependency(
                 name=name,
                 version=version,
-                parents=sorted(parents.get(name, set()) - local),
+                parents=[]
+                if (name, version) in direct
+                else sorted(parents.get((name, version), ())),
             )
-            for name, version in sorted(versions.items())
+            for name, version in rows
         ],
         skipped=skipped,
     )
@@ -413,6 +502,8 @@ def _read_cargo(ecosystem: str, source: str, content: str) -> Project | None:
 def _read_composer(ecosystem: str, source: str, content: str) -> Project | None:
     """Parse `composer.lock`."""
     data = json.loads(content)
+    if not isinstance(data, dict):
+        return None
     blocks = data.get("packages"), data.get("packages-dev")
     if not any(isinstance(b, list) for b in blocks):
         return None
@@ -429,7 +520,7 @@ def _read_composer(ecosystem: str, source: str, content: str) -> Project | None:
             if not _is_composer_package(name) or not isinstance(version, str):
                 continue
             versions[name] = version
-            for dep in entry.get("require") or {}:
+            for dep in _mapping(entry.get("require")):
                 if _is_composer_package(dep):
                     requires.setdefault(dep, set()).add(name)
 
@@ -459,9 +550,9 @@ def _read_toml(ecosystem: str, source: str, content: str) -> Project | None:
     if not isinstance(packages, list):
         return None
 
-    declared: set[str] = set()
-    parents: dict[str, set[str]] = {}
-    versions: dict[str, str] = {}
+    roots: list[set[tuple[str, str | None]]] = []
+    entries: list[tuple[str, str, set[tuple[str, str | None]]]] = []
+    by_name: dict[str, list[str]] = {}
     skipped = 0
 
     for entry in packages:
@@ -477,14 +568,29 @@ def _read_toml(ecosystem: str, source: str, content: str) -> Project | None:
         needs = _toml_dependencies(entry)
 
         if is_root:
-            declared |= needs
+            roots.append(needs)
             continue
 
         if isinstance(version, str):
-            versions[name] = version
-        for dependency in needs:
-            parents.setdefault(dependency, set()).add(name)
+            entries.append((name, version, needs))
+            if version not in by_name.setdefault(name, []):
+                by_name[name].append(version)
 
+    def targets(reference: tuple[str, str | None]) -> list[tuple[str, str]]:
+        name, wanted = reference
+        known = by_name.get(name, [])
+        if wanted is not None:
+            return [(name, wanted)] if wanted in known else []
+        return [(name, version) for version in known]
+
+    declared = {target for needs in roots for ref in needs for target in targets(ref)}
+    parents: dict[tuple[str, str], set[str]] = {}
+    for name, _version, needs in entries:
+        for reference in needs:
+            for target in targets(reference):
+                parents.setdefault(target, set()).add(name)
+
+    rows = sorted({(name, version) for name, version, _ in entries})
     return Project(
         ecosystem=ecosystem,
         source=source,
@@ -492,42 +598,54 @@ def _read_toml(ecosystem: str, source: str, content: str) -> Project | None:
             Dependency(
                 name=name,
                 version=version,
-                parents=[] if name in declared else sorted(parents.get(name, ())),
+                parents=[]
+                if (name, version) in declared
+                else sorted(parents.get((name, version), ())),
             )
-            for name, version in sorted(versions.items())
+            for name, version in rows
         ],
         skipped=skipped,
     )
 
 
-def _toml_dependencies(entry: dict) -> set[str]:
-    """Return the dependency names of one lock entry."""
-    names: set[str] = set()
+def _toml_dependencies(entry: dict) -> set[tuple[str, str | None]]:
+    """Return the (name, version or None) references of one lock entry."""
+    found: set[tuple[str, str | None]] = set()
+
+    def add(item: object) -> None:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            version = item.get("version")
+            found.add((item["name"], version if isinstance(version, str) else None))
 
     for item in entry.get("dependencies") or []:
-        if isinstance(item, dict) and isinstance(item.get("name"), str):
-            names.add(item["name"])
-        elif isinstance(item, str):
-            names.add(item)
+        if isinstance(item, str):
+            found.add((item, None))
+        else:
+            add(item)
 
     metadata = entry.get("metadata") or {}
     for item in (
         (metadata.get("requires-dist") or []) if isinstance(metadata, dict) else []
     ):
         if isinstance(item, dict) and isinstance(item.get("name"), str):
-            names.add(item["name"])
+            found.add((item["name"], None))
 
     poetry = entry.get("dependencies")
     if isinstance(poetry, dict):
-        names |= {k for k in poetry if isinstance(k, str)}
+        found |= {(k, None) for k in poetry if isinstance(k, str)}
 
-    return names
+    return found
 
 
 _REQUIREMENT = re.compile(
     r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?\s*"
-    r"(?P<op>==|===)\s*(?P<version>[^\s;#]+)"
+    r"(?P<op>===|==)\s*(?P<version>[^\s;#,=*]+)\s*(;.*)?$"
 )
+
+
+def _requirement_text(raw: str) -> str:
+    """Return a requirements line without its comment or trailing backslash."""
+    return raw.split("#", 1)[0].strip().removesuffix("\\").rstrip()
 _REQUIREMENT_NAME = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)")
 _DIRECT_REFERENCE = re.compile(
     r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*@\s*\S+\s*(;.*)?$"
@@ -539,7 +657,7 @@ def _read_requirements(ecosystem: str, source: str, content: str) -> Project | N
     dependencies: list[Dependency] = []
     skipped = 0
     for raw in content.splitlines():
-        line = raw.split("#", 1)[0].strip()
+        line = _requirement_text(raw)
         if not line:
             continue
         if line.startswith("-"):
@@ -586,9 +704,11 @@ def _npm_pinned(spec: object) -> str:
 def _read_package_json(ecosystem: str, source: str, content: str) -> Project | None:
     """Parse `package.json`."""
     data = json.loads(content)
+    if not isinstance(data, dict):
+        return None
     declared = {
-        **(data.get("dependencies") or {}),
-        **(data.get("devDependencies") or {}),
+        **_mapping(data.get("dependencies")),
+        **_mapping(data.get("devDependencies")),
     }
     return Project(
         ecosystem=ecosystem,

@@ -485,14 +485,52 @@ def cmd_push(args: argparse.Namespace) -> int:
                 print(KEY_HOWTO.format(server=settings.server), file=sys.stderr)
             return 2
 
+        created = result.get("created") is True
         bits = [f"{result['stored']} packages from {project.source}"]
+        if created:
+            bits.insert(0, "new project")
+        if result.get("unchanged") is True:
+            bits.append("no change since the last push")
         if result["withdrawn"]:
             bits.append(f"{result['withdrawn']} withdrawn")
-        bits.append(f"{result['behind']} of yours behind")
-        if result.get("unpinned"):
-            bits.append(f"{result['unpinned']} unmeasurable (ranges, not versions)")
+        not_compared = result.get("not_compared")
+        looking_up = result.get("being_looked_up") or 0
+        unpinned = result.get("unpinned") or 0
+        if (
+            not_compared is not None
+            and result["stored"]
+            and not_compared + unpinned >= result["stored"]
+        ):
+            bits.append("none compared yet" if looking_up else "none compared")
+        else:
+            bits.append(f"{result['behind']} of yours behind")
+        if unpinned:
+            bits.append(f"{unpinned} unmeasurable (ranges, not versions)")
+        if looking_up:
+            bits.append(f"{looking_up} being looked up; push again when that finishes")
+        if not_compared and not_compared > looking_up:
+            bits.append(f"{not_compared - looking_up} could not be compared")
         print(f"{name}: {', '.join(bits)}")
         print(f"  {settings.server}{result['url']}")
+        if result.get("lookups_refused"):
+            print(
+                "  warning: rate limit: PackageTrack's lookup queue is full for "
+                f"this hour ({result['lookups_refused']} not looked up). "
+                "Push again later.",
+                file=sys.stderr,
+            )
+        similar = result.get("similar_to") or []
+        if similar:
+            best = similar[0]
+            print(
+                f"  note: project {best['name']!r} holds the same dependency "
+                f"set ({best['overlap']:.0%} of the packages in common); to "
+                f"update that one instead, push with --name {best['name']}",
+                file=sys.stderr,
+            )
+        if similar[1:]:
+            others = ", ".join(repr(s["name"]) for s in similar[1:])
+            print(f"  note: also holding it: {others}", file=sys.stderr)
 
         for verdict in result.get("rules") or []:
             if verdict["met"]:

@@ -90,8 +90,9 @@ def test_npm_lock_workspace_folder(tmp_path: Path):
         )
     )
     project = read("npm", tmp_path / "package-lock.json")
-    assert "express" in {d.name for d in project.dependencies}
-    assert "@myapp/ui" not in {d.name for d in project.dependencies}
+    names = {d.name for d in project.dependencies}
+    assert names == {"express"}
+    assert "@myapp/ui" not in names and "packages/ui" not in names
 
 
 def test_npm_lock_nested_copies(tmp_path: Path):
@@ -1434,6 +1435,39 @@ def test_snapshot_payload_indirect():
     assert packages["github.com/spf13/viper"]["indirect"] is False
 
 
+def _push_line(monkeypatch, capsys, result: dict) -> str:
+    """The first line `push` prints for a server answer, nothing else faked."""
+    return _push_output(monkeypatch, capsys, result)[0]
+
+
+def _push_output(monkeypatch, capsys, result: dict) -> list[str]:
+    """Every line `push` prints to stdout for a server answer."""
+    import argparse
+    from types import SimpleNamespace
+
+    import packagetrackdev.__main__ as cli_main
+
+    project = SimpleNamespace(ecosystem="pypi", source="uv.lock", dependencies=[])
+    monkeypatch.setattr(cli_main, "_projects_or_exit", lambda folder, eco: [project])
+    monkeypatch.setattr(cli_main, "push", lambda *args, **kwargs: result)
+    monkeypatch.setattr(
+        cli_main.config,
+        "load",
+        lambda **kwargs: SimpleNamespace(api_key="pkgt_x", server="https://pt.test"),
+    )
+    args = argparse.Namespace(
+        api_key=None,
+        server=None,
+        project=Path("."),
+        ecosystem=None,
+        dry_run=False,
+        name="repro-unmeasured",
+    )
+    capsys.readouterr()
+    assert cli_main.cmd_push(args) == 0
+    return capsys.readouterr().out.splitlines()
+
+
 def _answer(**fields) -> dict:
     base = {
         "project": "repro-unmeasured",
@@ -1446,6 +1480,179 @@ def _answer(**fields) -> dict:
         "unmeasured_note": None,
     }
     return {**base, **fields}
+
+
+def test_a_first_push_nobody_compared_does_not_say_zero_behind(monkeypatch, capsys):
+    line = _push_line(monkeypatch, capsys, _answer(not_compared=6, being_looked_up=6))
+    assert line == (
+        "repro-unmeasured: 6 packages from uv.lock, none compared yet, "
+        "6 being looked up; push again when that finishes"
+    )
+    assert "of yours behind" not in line
+
+
+def test_the_push_line_names_what_was_not_compared_beside_the_count(
+    monkeypatch, capsys
+):
+    looking = _push_line(
+        monkeypatch,
+        capsys,
+        _answer(stored=3, behind=1, not_compared=2, being_looked_up=2),
+    )
+    assert looking == (
+        "repro-unmeasured: 3 packages from uv.lock, 1 of yours behind, "
+        "2 being looked up; push again when that finishes"
+    )
+    denied = _push_line(
+        monkeypatch,
+        capsys,
+        _answer(stored=3, behind=1, not_compared=2, being_looked_up=0),
+    )
+    assert denied == (
+        "repro-unmeasured: 3 packages from uv.lock, 1 of yours behind, "
+        "2 could not be compared"
+    )
+
+
+def test_the_rate_limit_warning_names_the_count(monkeypatch, capsys):
+    """The push is stored; the lookups the hourly ceiling refused are said on
+    stderr, and nothing promises a time."""
+    import argparse
+    from types import SimpleNamespace
+
+    import packagetrackdev.__main__ as cli_main
+
+    project = SimpleNamespace(ecosystem="pypi", source="uv.lock", dependencies=[])
+    monkeypatch.setattr(cli_main, "_projects_or_exit", lambda folder, eco: [project])
+    monkeypatch.setattr(
+        cli_main,
+        "push",
+        lambda *a, **k: _answer(lookups_refused=2),
+    )
+    monkeypatch.setattr(
+        cli_main.config,
+        "load",
+        lambda **kwargs: SimpleNamespace(api_key="pkgt_x", server="https://pt.test"),
+    )
+    args = argparse.Namespace(
+        api_key=None,
+        server=None,
+        project=Path("."),
+        ecosystem=None,
+        dry_run=False,
+        name="repro-unmeasured",
+    )
+    capsys.readouterr()
+    assert cli_main.cmd_push(args) == 0, "a refused lookup does not fail the push"
+    err = capsys.readouterr().err
+    assert (
+        "warning: rate limit: PackageTrack's lookup queue is full for this hour "
+        "(2 not looked up). Push again later."
+    ) in err
+
+
+def test_no_rate_limit_warning_without_a_refusal(monkeypatch, capsys):
+    _push_line(monkeypatch, capsys, _answer())
+    assert "rate limit" not in capsys.readouterr().err
+
+
+def test_a_server_without_the_fields_gets_the_line_it_always_got(monkeypatch, capsys):
+    line = _push_line(monkeypatch, capsys, _answer())
+    assert line == "repro-unmeasured: 6 packages from uv.lock, 0 of yours behind"
+
+
+def test_a_push_that_made_the_project_says_so(monkeypatch, capsys):
+    """A renamed folder used to become a second project in silence."""
+    line = _push_line(monkeypatch, capsys, _answer(created=True))
+    assert line == (
+        "repro-unmeasured: new project, 6 packages from uv.lock, 0 of yours behind"
+    )
+
+
+def test_a_new_project_gets_no_advice_line(monkeypatch, capsys):
+    """Only the fact: the generic "if it exists under another name" line fired
+    on projects that were new on purpose."""
+    out = _push_output(monkeypatch, capsys, _answer(created=True))
+    assert out[0].startswith("repro-unmeasured: new project, ")
+    assert len(out) == 2
+    assert out[1] == "  https://pt.test/app/projects/repro-unmeasured"
+
+
+def test_a_push_that_replaced_the_project_reads_as_it_always_did(monkeypatch, capsys):
+    out = _push_output(monkeypatch, capsys, _answer(created=False))
+    assert out[0] == "repro-unmeasured: 6 packages from uv.lock, 0 of yours behind"
+    assert len(out) == 2
+
+
+def _push_streams(monkeypatch, capsys, result: dict) -> tuple[list[str], list[str]]:
+    """Both streams `push` writes for a server answer: (stdout, stderr)."""
+    _push_output(monkeypatch, capsys, result)
+    import argparse
+
+    import packagetrackdev.__main__ as cli_main
+
+    args = argparse.Namespace(
+        api_key=None,
+        server=None,
+        project=Path("."),
+        ecosystem=None,
+        dry_run=False,
+        name="repro-unmeasured",
+    )
+    assert cli_main.cmd_push(args) == 0
+    captured = capsys.readouterr()
+    return captured.out.splitlines(), captured.err.splitlines()
+
+
+def test_an_unchanged_push_says_so_in_the_line(monkeypatch, capsys):
+    """The server wrote no history entry; the line says why nothing moved."""
+    line = _push_line(monkeypatch, capsys, _answer(created=False, unchanged=True))
+    assert line == (
+        "repro-unmeasured: 6 packages from uv.lock, no change since the last "
+        "push, 0 of yours behind"
+    )
+
+
+def test_a_set_another_project_holds_is_a_note_on_stderr(monkeypatch, capsys):
+    """The push stands; the note names the project and how to update it."""
+    out, err = _push_streams(
+        monkeypatch,
+        capsys,
+        _answer(
+            created=True,
+            similar_to=[{"name": "shop", "overlap": 1.0}],
+        ),
+    )
+    assert len(out) == 2, "stdout keeps its two lines"
+    assert err == [
+        "  note: project 'shop' holds the same dependency set (100% of the "
+        "packages in common); to update that one instead, push with --name shop"
+    ]
+
+
+def test_several_projects_holding_the_set_are_one_more_line(monkeypatch, capsys):
+    """The closest gets the sentence; four copies used to be four notes."""
+    _, err = _push_streams(
+        monkeypatch,
+        capsys,
+        _answer(
+            created=True,
+            similar_to=[
+                {"name": "shop", "overlap": 1.0},
+                {"name": "shop-old", "overlap": 1.0},
+                {"name": "shop-agent", "overlap": 0.95},
+            ],
+        ),
+    )
+    assert len(err) == 2
+    assert err[0].startswith("  note: project 'shop' holds the same dependency set")
+    assert err[1] == "  note: also holding it: 'shop-old', 'shop-agent'"
+
+
+def test_a_server_without_similar_to_prints_no_note(monkeypatch, capsys):
+    out, err = _push_streams(monkeypatch, capsys, _answer(created=True))
+    assert err == []
+    assert out[0].startswith("repro-unmeasured: new project, ")
 
 
 class _FakeClient:
@@ -1996,3 +2203,409 @@ def test_stdout_is_utf8_too_when_redirected():
     )
     result = _under_cp1252(["-c", code])
     assert result.stdout.strip() == "clipped note…".encode()
+
+
+def test_push_over_a_name_of_another_ecosystem_prints_the_servers_reason(
+    monkeypatch, capsys
+):
+    """The server refuses it and the CLI adds no rule of its own:
+    it prints the server's sentence and exits 2, pushing nothing else."""
+    import argparse
+    from types import SimpleNamespace
+
+    import packagetrackdev.__main__ as cli_main
+
+    detail = (
+        "Nothing was pushed. Project 'shop' holds pypi dependencies, and npm "
+        "dependencies cannot replace them: that is another project, not an "
+        "update. Push it under another name, such as 'shop-npm'."
+    )
+    client = _FakeClient(
+        [(409, {"code": "ecosystem_conflict", "detail": detail, "project": "shop"})]
+    )
+    monkeypatch.setattr(cli_main.httpx, "Client", lambda **kwargs: client)
+    npm = _project([], ecosystem="npm", source="package-lock.json")
+    monkeypatch.setattr(cli_main, "_projects_or_exit", lambda folder, eco: [npm])
+    monkeypatch.setattr(
+        cli_main.config,
+        "load",
+        lambda **kwargs: SimpleNamespace(api_key="pkgt_x", server="https://pt.test"),
+    )
+    args = argparse.Namespace(
+        api_key=None,
+        server=None,
+        project=Path("."),
+        ecosystem=None,
+        dry_run=False,
+        name="shop",
+    )
+    capsys.readouterr()
+
+    code = cli_main.cmd_push(args)
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.err.strip() == (
+        f"error: https://pt.test answered HTTP 409: {detail}"
+    )
+    assert captured.out == ""
+    assert len(client.sent) == 1
+
+
+_ENCODED_FILES = [
+    ("pypi", "requirements.txt", "flask==3.0.0\nrequests==2.31.0\n"),
+    ("npm", "package.json", json.dumps({"dependencies": {"left-pad": "1.3.0"}})),
+    (
+        "npm",
+        "package-lock.json",
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {"": {}, "node_modules/ms": {"version": "2.1.3"}},
+            }
+        ),
+    ),
+    (
+        "pypi",
+        "uv.lock",
+        'version = 1\n[[package]]\nname = "flask"\nversion = "3.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n',
+    ),
+]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-16-le-bom"])
+@pytest.mark.parametrize(("ecosystem", "filename", "text"), _ENCODED_FILES)
+def test_a_marked_encoding_reads_like_plain_utf8(
+    tmp_path: Path, ecosystem, filename, text, encoding
+):
+    from packagetrackdev.lockfiles import read
+
+    plain = tmp_path / "plain"
+    marked = tmp_path / "marked"
+    plain.mkdir()
+    marked.mkdir()
+    (plain / filename).write_bytes(text.encode("utf-8"))
+    if encoding == "utf-16-le-bom":
+        raw = b"\xff\xfe" + text.replace("\n", "\r\n").encode("utf-16-le")
+    else:
+        raw = text.encode(encoding)
+    (marked / filename).write_bytes(raw)
+
+    expected = read(ecosystem, plain / filename)
+    got = read(ecosystem, marked / filename)
+
+    assert expected is not None and expected.dependencies
+    assert got is not None
+    assert [(d.name, d.version) for d in got.dependencies] == [
+        (d.name, d.version) for d in expected.dependencies
+    ]
+    assert got.skipped == expected.skipped
+
+
+def test_bytes_that_are_no_text_are_refused_not_raised(tmp_path: Path):
+    from packagetrackdev.lockfiles import decode, read
+
+    path = tmp_path / "requirements.txt"
+    path.write_bytes(b"flask==3.0.0\n\xc3\x28\n")
+    assert decode(path.read_bytes()) is None
+    assert read("pypi", path) is None
+
+
+def test_a_bom_in_text_does_not_hide_the_format():
+    from packagetrackdev.lockfiles import detect, parse
+
+    bom = chr(0xFEFF)
+    lock = _ENCODED_FILES[2][2]
+    assert detect(bom + lock) == ("npm", "package-lock.json")
+    project = parse("pypi", "requirements.txt", bom + "flask==3.0.0\n")
+    assert [d.name for d in project.dependencies] == ["flask"]
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("a===1.0", [("a", "1.0")]),
+        ("a === 1.0", [("a", "1.0")]),
+        ("a[x]===1.0", [("a", "1.0")]),
+        ('a===1.0 ; python_version<"3.13"', [("a", "1.0")]),
+        ("a===foobar", [("a", "foobar")]),
+        ("a==1.0", [("a", "1.0")]),
+        ("a==1.0+local", [("a", "1.0+local")]),
+        ("a==1.0,<2", [("a", "")]),
+        ("a==1.0, !=1.1", [("a", "")]),
+        ("a===1.0,<2", [("a", "")]),
+        ("a==1.*", [("a", "")]),
+        ("a==1.0.*", [("a", "")]),
+        ("a====1.0", []),
+        ("a== =1.0", []),
+    ],
+)
+def test_a_pin_is_one_exact_clause(line, expected):
+    from packagetrackdev.lockfiles import parse
+
+    project = parse("pypi", "requirements.txt", line + "\n")
+    assert [(d.name, d.version) for d in project.dependencies] == expected
+    assert project.skipped == (0 if expected else 1)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("attrs==23.1.0 \\", ("attrs", "23.1.0")),
+        ("attrs==23.1.0\\", ("attrs", "23.1.0")),
+        ("a===1.0 \\", ("a", "1.0")),
+        ('a==1.0 ; os_name=="nt" ' + chr(92), ("a", "1.0")),
+        ("a==1.0,<2 \\", ("a", "")),
+        ("a>=1 \\", ("a", "")),
+    ],
+)
+def test_a_hash_continuation_is_not_part_of_the_requirement(line, expected):
+    from packagetrackdev.lockfiles import detect, parse
+
+    content = line + "\n    --hash=sha256:abc\n"
+    project = parse("pypi", "requirements.txt", content)
+    assert [(d.name, d.version) for d in project.dependencies] == [expected]
+    assert project.skipped == 1
+    assert detect(content) == ("pypi", "requirements.txt")
+
+
+_NPM_WORKSPACES = {
+    "name": "mono",
+    "lockfileVersion": 3,
+    "packages": {
+        "": {
+            "name": "mono",
+            "workspaces": ["packages/*"],
+            "devDependencies": {"typescript": "^5.0.0"},
+        },
+        "packages/app": {
+            "name": "@mono/app",
+            "version": "0.1.0",
+            "dependencies": {"lodash": "^4.17.0", "@mono/lib": "*"},
+        },
+        "packages/lib": {
+            "name": "@mono/lib",
+            "version": "0.2.0",
+            "dependencies": {"ms": "^2.1.0"},
+        },
+        "packages/tool": {"name": "tool", "dependencies": {"chalk": "^5.0.0"}},
+        "node_modules/@mono/app": {"resolved": "packages/app", "link": True},
+        "node_modules/@mono/lib": {"resolved": "packages/lib", "link": True},
+        "node_modules/tool": {"resolved": "packages/tool", "link": True},
+        "node_modules/typescript": {"version": "5.4.5", "dev": True},
+        "node_modules/lodash": {"version": "4.17.21"},
+        "node_modules/ms": {"version": "2.1.3"},
+        "node_modules/chalk": {"version": "5.3.0", "dependencies": {"ansi": "^1"}},
+        "node_modules/ansi": {"version": "1.0.0"},
+    },
+}
+
+
+def test_npm_workspaces_are_the_project_not_its_dependencies(tmp_path: Path):
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps(_NPM_WORKSPACES), encoding="utf-8"
+    )
+    project = read("npm", tmp_path / "package-lock.json")
+
+    by_name = {d.name: d for d in project.dependencies}
+    assert sorted(by_name) == ["ansi", "chalk", "lodash", "ms", "typescript"]
+    for own in ("typescript", "lodash", "ms", "chalk"):
+        assert by_name[own].parents == [], own
+    assert by_name["ansi"].parents == ["chalk"]
+    assert project.skipped == 3
+
+
+def _npm_lock(tmp_path: Path, packages: dict):
+    from packagetrackdev.lockfiles import read
+
+    path = tmp_path / "package-lock.json"
+    path.write_text(
+        json.dumps({"lockfileVersion": 3, "packages": packages}), encoding="utf-8"
+    )
+    project = read("npm", path)
+    return {(d.name, d.version): d.parents for d in project.dependencies}
+
+
+def test_npm_a_nested_old_copy_names_the_package_that_pulled_it_in(tmp_path: Path):
+    rows = _npm_lock(
+        tmp_path,
+        {
+            "": {"dependencies": {"glob": "^10.0.0", "x": "^1.0.0"}},
+            "node_modules/glob": {
+                "version": "10.3.10",
+                "dependencies": {"minimatch": "^9"},
+            },
+            "node_modules/minimatch": {"version": "9.0.3"},
+            "node_modules/x": {"version": "1.0.0", "dependencies": {"glob": "^7"}},
+            "node_modules/x/node_modules/glob": {
+                "version": "7.0.0",
+                "dependencies": {"inflight": "^1", "minimatch": "^3"},
+            },
+            "node_modules/x/node_modules/minimatch": {"version": "3.1.2"},
+            "node_modules/inflight": {"version": "1.0.6"},
+            "node_modules/y": {"version": "2.0.0", "dependencies": {"minimatch": "^9"}},
+        },
+    )
+    assert rows[("glob", "10.3.10")] == []
+    assert rows[("glob", "7.0.0")] == ["x"]
+    assert rows[("minimatch", "9.0.3")] == ["glob", "y"]
+    assert rows[("minimatch", "3.1.2")] == ["glob"]
+    assert rows[("inflight", "1.0.6")] == ["glob"]
+
+
+def test_npm_a_workspace_finds_its_own_nested_copy_first(tmp_path: Path):
+    rows = _npm_lock(
+        tmp_path,
+        {
+            "": {"workspaces": ["packages/*"], "dependencies": {"x": "^2"}},
+            "packages/app": {"name": "app", "dependencies": {"x": "^1"}},
+            "node_modules/app": {"resolved": "packages/app", "link": True},
+            "node_modules/x": {"version": "2.0.0"},
+            "packages/app/node_modules/x": {"version": "1.0.0"},
+        },
+    )
+    assert rows == {("x", "2.0.0"): [], ("x", "1.0.0"): []}
+
+
+def test_npm_one_version_in_two_places_is_one_row(tmp_path: Path):
+    rows = _npm_lock(
+        tmp_path,
+        {
+            "": {"dependencies": {"ms": "^2", "a": "^1", "b": "^1"}},
+            "node_modules/ms": {"version": "2.1.3"},
+            "node_modules/a": {"version": "1.0.0", "dependencies": {"ms": "^1"}},
+            "node_modules/a/node_modules/ms": {"version": "1.0.0"},
+            "node_modules/b": {"version": "1.0.0", "dependencies": {"ms": "^1"}},
+            "node_modules/b/node_modules/ms": {"version": "1.0.0"},
+        },
+    )
+    assert rows[("ms", "2.1.3")] == []
+    assert rows[("ms", "1.0.0")] == ["a", "b"]
+
+
+_CARGO_TWO_SYNS = """version = 3
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["serde_derive", "syn 2.0.50", "log"]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+    "log",
+    "syn 1.0.109 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = ["unicode-ident"]
+
+[[package]]
+name = "syn"
+version = "2.0.50"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = ["unicode-ident"]
+
+[[package]]
+name = "unicode-ident"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "log"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"""
+
+
+def test_cargo_keeps_both_versions_of_a_crate():
+    from packagetrackdev.lockfiles import parse
+
+    project = parse("cargo", "Cargo.lock", _CARGO_TWO_SYNS)
+    rows = {(d.name, d.version): d.parents for d in project.dependencies}
+    assert rows == {
+        ("log", "0.4.20"): [],  # the app's own, though serde_derive wants it too
+        ("serde_derive", "1.0.0"): [],
+        ("syn", "1.0.109"): ["serde_derive"],
+        ("syn", "2.0.50"): [],
+        ("unicode-ident", "1.0.12"): ["syn"],
+    }
+    assert project.skipped == 0
+
+
+_UV_FORKED_NUMPY = """version = 1
+requires-python = ">=3.9"
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "numpy", version = "1.26.4", marker = "python_full_version < '3.10'" },
+    { name = "numpy", version = "2.1.0", marker = "python_full_version >= '3.10'" },
+    { name = "pandas" },
+]
+
+[[package]]
+name = "numpy"
+version = "1.26.4"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "numpy"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "pandas"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "1.26.4", marker = "python_full_version < '3.10'" },
+    { name = "numpy", version = "2.1.0", marker = "python_full_version >= '3.10'" },
+    { name = "tzdata" },
+]
+
+[[package]]
+name = "tzdata"
+version = "2024.1"
+source = { registry = "https://pypi.org/simple" }
+"""
+
+
+def test_uv_keeps_both_sides_of_a_marker_fork():
+    from packagetrackdev.lockfiles import parse
+
+    project = parse("pypi", "uv.lock", _UV_FORKED_NUMPY)
+    rows = {(d.name, d.version): d.parents for d in project.dependencies}
+    assert rows == {
+        ("numpy", "1.26.4"): [],
+        ("numpy", "2.1.0"): [],
+        ("pandas", "2.2.0"): [],
+        ("tzdata", "2024.1"): ["pandas"],
+    }
+
+
+def test_poetry_keeps_both_versions_of_a_name():
+    from packagetrackdev.lockfiles import parse
+
+    content = (
+        '[[package]]\nname = "numpy"\nversion = "1.26.4"\n\n'
+        '[[package]]\nname = "numpy"\nversion = "2.1.0"\n\n'
+        '[[package]]\nname = "pandas"\nversion = "2.2.0"\n\n'
+        '[package.dependencies]\nnumpy = ">=1.22"\n\n'
+        '[metadata]\nlock-version = "2.0"\ncontent-hash = "abc"\n'
+    )
+    project = parse("pypi", "poetry.lock", content)
+    rows = {(d.name, d.version): d.parents for d in project.dependencies}
+    assert rows == {
+        ("numpy", "1.26.4"): ["pandas"],
+        ("numpy", "2.1.0"): ["pandas"],
+        ("pandas", "2.2.0"): [],
+    }
